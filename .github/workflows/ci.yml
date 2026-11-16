@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  sh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shells
+        run: sudo apt-get update && sudo apt-get install -y busybox dash zsh
+      - name: shellcheck
+        run: shellcheck -s sh dnstest.sh
+      - name: Self-test in every shell
+        env:
+          DNSTEST_REEXEC: "1"
+        run: |
+          for sh in dash "busybox sh" bash zsh; do
+            echo "== $sh"
+            $sh dnstest.sh --self-test
+          done
+      - name: Catalog in dnstest.sh and dnstest.ps1 is identical
+        run: |
+          sed -n '/^catalog() {/,/^EOF$/p' dnstest.sh | sed '1,2d;$d' > sh.txt
+          sed -n "/^\$Catalog = @'/,/^'@/p" dnstest.ps1 | tr -d '\r' | sed '1d;$d' > ps.txt
+          test -s sh.txt
+          diff sh.txt ps.txt
+      - name: dnstest.ps1 is ASCII only
+        run: "! LC_ALL=C grep -n '[^[:print:][:space:]]' dnstest.ps1"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t dns-speedtest .
+      - run: docker run --rm dns-speedtest --self-test
+
+  ps1:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $out = & .\dnstest.ps1 -SelfTest 6>&1 | Out-String
+          $out
+          if ($out -cmatch '(?m)^FAIL') { exit 1 }
+      - name: PowerShell 7
+        shell: pwsh
+        run: |
+          $out = & .\dnstest.ps1 -SelfTest 6>&1 | Out-String
+          $out
+          if ($out -cmatch '(?m)^FAIL') { exit 1 }

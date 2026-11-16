@@ -1,13 +1,13 @@
-FROM alpine:latest
+FROM alpine:3.22
 
-LABEL maintainer="mazixs" \
-      description="DNS Performance & Stability Test (RU/Global)" \
-      version="2.0.1"
+LABEL org.opencontainers.image.title="dns-speedtest" \
+      org.opencontainers.image.description="DNS, DoT and DoH speed test" \
+      org.opencontainers.image.source="https://github.com/mazixs/dns-speedtest" \
+      org.opencontainers.image.licenses="GPL-3.0"
 
-RUN apk --no-cache add bash bind-tools \
-    && mkdir /app \
-    && wget -q https://raw.githubusercontent.com/mazixs/dnsperftest-ru/v2.0.1/dnstest.sh -O /app/dnstest.sh \
-    && chmod +x /app/dnstest.sh
+# bash gives a microsecond timer, kdig handles UDP and DoT, curl handles DoH over HTTP/2.
+RUN apk add --no-cache bash ca-certificates curl knot-utils openssl
 
-WORKDIR /app
-ENTRYPOINT ["bash", "/app/dnstest.sh"]
+COPY dnstest.sh /usr/local/bin/dnstest.sh
+
+ENTRYPOINT ["sh", "/usr/local/bin/dnstest.sh"]

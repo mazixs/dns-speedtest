@@ -1,1694 +1,1490 @@
-#!/usr/bin/env bash
+#!/bin/sh
+# dns-speedtest — тест скорости DNS, DoT и DoH одним POSIX sh-файлом.
+# BusyBox ash (OpenWrt, Keenetic/Entware, ASUSWRT-Merlin), dash, bash, zsh.
+# https://github.com/mazixs/dns-speedtest · GPL-3.0
+# shellcheck disable=SC3043,SC2059
+#   SC3043: local есть во всех целевых шеллах.
+#   SC2059: DNS-запрос передаётся в printf как формат из \ooo-escape, символа % в нём нет.
 
-set -u
+VERSION=4.0.0
+PROJECT_URL=https://github.com/mazixs/dns-speedtest
 
-VERSION="3.0.0"
+# Без $EPOCHREALTIME и dig замеры грубее: если в системе есть bash, перезапускаемся в нём.
+if [ -z "${BASH_VERSION:-}" ] && [ -z "${DNSTEST_REEXEC:-}" ] && [ -f "$0" ] &&
+  command -v bash >/dev/null 2>&1 &&
+  { [ -z "${EPOCHREALTIME:-}" ] || ! command -v dig >/dev/null 2>&1; }; then
+  DNSTEST_REEXEC=1
+  export DNSTEST_REEXEC
+  exec bash "$0" "$@"
+fi
 
-PROGRAM_NAME=${0##*/}
-DEFAULT_QUICK_RUNS=1
-DEFAULT_STABILITY_RUNS=10
-DNS_TIMEOUT=3
-DOH_TIMEOUT=5
-DOT_TIMEOUT=5
-TOP_N=3
+[ -n "${ZSH_VERSION:-}" ] && emulate sh
+set -f
+LC_ALL=C
+export LC_ALL
+umask 077
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-MAGENTA='\033[0;35m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+DOMAINS_RU="ya.ru mail.ru vk.com ozon.ru gosuslugi.ru"
+DOMAINS_GLOBAL="www.google.com www.youtube.com www.wikipedia.org www.amazon.com github.com"
+ROOT4=198.41.0.4             # a.root-servers.net: рекурсию не выполняет, ответ с записями = перехват
+ROOT6=2001:503:ba3e::2:30
+V6_PROBE=2606:4700:4700::1111
+PAR=8                        # параллельных проверок доступности
 
-USE_COLOR=false
-COMPACT_OUTPUT=false
-HAS_TTY=false
-TERMINAL_WIDTH=80
-NO_COLOR_FLAG=false
+OPT_LANG="" OPT_PROFILE="" OPT_RUNS="" OPT_DOMAINS="" OPT_CUSTOM="" OPT_PROVIDERS="" OPT_MODES=""
+OPT_VARIANTS="" OPT_TOP=0 OPT_CSV="" OPT_TIMEOUT=1 OPT_YES=0 OPT_COLOR=auto ACTION=run
 
-PROFILE=""
-LANG_CHOICE=""
-DOMAINS_CHOICE=""
-CUSTOM_DOMAINS_RAW=""
-PROVIDERS_CHOICE=""
-RUNS=""
-SELECTED_MODES=()
-SELECTED_DOMAINS=()
-IPV6_STACK_AVAILABLE=false
-TIMER_SOURCE="unknown"
-
-PROVIDER_CATALOG=$(cat <<'EOF'
-cloudflare|Cloudflare|global|1.1.1.1|2606:4700:4700::1111|https://cloudflare-dns.com/dns-query|1.1.1.1|2606:4700:4700::1111|cloudflare-dns.com|1.1.1.1|2606:4700:4700::1111|anycast,official
-cloudflare-sec|Cloudflare-Sec|global|1.0.0.1||https://security.cloudflare-dns.com/dns-query|1.0.0.1||security.cloudflare-dns.com|1.0.0.1||secure-filter
-cleanbrowsing|CleanBrowsing|global|185.228.168.9|2a0d:2a00:1::1|https://doh.cleanbrowsing.org/doh/family-filter/|185.228.168.9|2a0d:2a00:1::1|family-filter-dns.cleanbrowsing.org|185.228.168.9|2a0d:2a00:1::1|family-filter
-cleanbrowsing-sec|CleanBrowsing-Sec|global|185.228.169.9||https://doh.cleanbrowsing.org/doh/security-filter/|185.228.169.9||security-filter-dns.cleanbrowsing.org|185.228.169.9||security-filter
-adguard|Adguard|global|94.140.14.14|2a00:5a60::ad1:0ff|https://dns.adguard-dns.com/dns-query|94.140.14.14|2a00:5a60::ad1:0ff|dns.adguard-dns.com|94.140.14.14|2a00:5a60::ad1:0ff|anycast,official
-adguard-sec|Adguard-Sec|global|94.140.15.15||https://dns-family.adguard-dns.com/dns-query|94.140.15.15||dns-family.adguard-dns.com|94.140.15.15||family-filter
-controld-uncensored|ControlD-Uncensored|global|76.76.2.0||https://freedns.controld.com/uncensored|76.76.2.0||freedns.controld.com|76.76.2.0||anycast
-controld-sec|ControlD-Sec|global|76.76.10.0||https://freedns.controld.com/p0|76.76.10.0||freedns.controld.com|76.76.10.0||secure-filter
-dnssb|DNS.SB|global|185.222.222.222||https://doh.dns.sb/dns-query|185.222.222.222||dot.dns.sb|185.222.222.222||official
-dnssb-sec|DNS.SB-Sec|global|45.11.45.11||||||||secure-filter
-dns0eu|DNS0.EU|global|193.110.81.254||https://dns0.eu/dns-query|193.110.81.254||dns0.eu|193.110.81.254||official
-dns0eu-sec|DNS0.EU-Sec|global|185.253.5.254||https://dns0.eu/zero/dns-query|185.253.5.254||zero.dns0.eu|185.253.5.254||secure-filter
-google|Google|global|8.8.8.8|2001:4860:4860::8888|https://dns.google/dns-query|8.8.8.8|2001:4860:4860::8888|dns.google|8.8.8.8|2001:4860:4860::8888|anycast,official
-google-sec|Google-Sec|global|8.8.4.4||https://dns.google/dns-query|8.8.4.4||dns.google|8.8.4.4||alt-ip
-mullvad|Mullvad|global|194.242.2.2||https://doh.mullvad.net/dns-query|194.242.2.2||dot.mullvad.net|194.242.2.2||official
-gcore|Gcore|global|95.85.95.85|2a03:90c0:999d::1|||||||official
-gcore-sec|Gcore-Sec|global|2.56.220.2|2a03:90c0:9992::1|||||||secure-filter
-quad9|Quad9|global|9.9.9.9|2620:fe::fe||||dns.quad9.net|9.9.9.9|2620:fe::fe|anycast,official,dot-only
-quad9-sec|Quad9-Sec|global|149.112.112.112||https://dns.quad9.net/dns-query|149.112.112.112||dns.quad9.net|149.112.112.112||secure-filter
-verisign|Verisign|global|64.6.64.6||||||||legacy
-verisign-sec|Verisign-Sec|global|64.6.65.6||||||||legacy,secure-filter
-dnswatch|DNS.WATCH|global|84.200.69.80||||||||legacy
-dnswatch-sec|DNS.WATCH-Sec|global|84.200.70.40||||||||legacy,secure-filter
-safedns|SafeDNS|global|195.46.39.39|2001:67c:2778::3939|||||||official
-safedns-sec|SafeDNS-Sec|global|195.46.39.40|2001:67c:2778::3940|||||||official
-uncensoreddns|UncensoredDNS|global|91.239.100.100||https://anycast.uncensoreddns.org/dns-query|91.239.100.100||unicast.uncensoreddns.org|91.239.100.100||official
-uncensoreddns-sec|UncensoredDNS-Sec|global|89.233.43.71||||||||secure-filter
-opendns|OpenDNS|global|208.67.222.222|2620:119:35::35|https://doh.opendns.com/dns-query|208.67.222.222|2620:119:35::35|dns.opendns.com|208.67.222.222|2620:119:35::35|official
-opendns-sec|OpenDNS-Sec|global|208.67.220.220||||||||secure-filter
-comodo|Comodo|global|8.26.56.26||||||||legacy
-comodo-sec|Comodo-Sec|global|8.20.247.20||||||||legacy,secure-filter
-level3|Level3|global|4.2.2.1||||||||legacy
-level3-a|Level3-A|global|209.244.0.3||||||||legacy
-level3-b|Level3-B|global|209.244.0.4||||||||legacy
-nextdns|NextDNS|global|45.90.28.19|2a07:a8c0::15:8114|https://dns.nextdns.io|45.90.28.19|2a07:a8c0::15:8114|dns.nextdns.io|45.90.28.19|2a07:a8c0::15:8114|anycast,no-profile
-nextdns-sec|NextDNS-Sec|global|45.90.30.19|2a07:a8c1::15:8114|https://dns.nextdns.io|45.90.30.19|2a07:a8c1::15:8114|dns.nextdns.io|45.90.30.19|2a07:a8c1::15:8114|anycast,no-profile
-nwpsfi|NWPS.fi|global|95.217.11.63|2a01:4f9:c012:25a0::1|https://public.ns.nwps.fi/dns-query|95.217.11.63|2a01:4f9:c012:25a0::1|public.ns.nwps.fi|95.217.11.63|2a01:4f9:c012:25a0::1|official
-nwpsfi-sec|NWPS.fi-Sec|global|135.181.103.31|2a01:4f9:c011:aa31::1|https://kids.ns.nwps.fi/dns-query|135.181.103.31|2a01:4f9:c011:aa31::1|kids.ns.nwps.fi|135.181.103.31|2a01:4f9:c011:aa31::1|kids-filter
-comss|Comss.one|ru|83.220.169.155||https://dns.comss.one/dns-query|83.220.169.155||dns.comss.one|83.220.169.155||official
-comss-sec|Comss.one-Sec|ru|212.109.195.93||https://dns.comss.one/dns-query|212.109.195.93||dns.comss.one|212.109.195.93||secure-filter
-yandex|Yandex|ru|77.88.8.8|2a02:6b8::feed:0ff|https://common.dot.dns.yandex.net/dns-query|77.88.8.8||common.dot.dns.yandex.net|77.88.8.8||official
-yandex-sec|Yandex-Sec|ru|77.88.8.1||https://common.dot.dns.yandex.net/dns-query|77.88.8.1||common.dot.dns.yandex.net|77.88.8.1||secure-filter
-nsdi|NSDI|ru|195.208.4.1||||||||legacy
-nsdi-sec|NSDI-Sec|ru|195.208.5.1||||||||legacy,secure-filter
-rostelecom|Rostelecom|ru|91.122.77.189||||||||legacy
-mts|MTS|ru|195.210.172.43||||||||legacy
-mts-sec|MTS-Sec|ru|195.210.172.46||||||||legacy,secure-filter
-akado|AKADO|ru|217.10.44.35||||||||legacy
+# ---------------------------------------------------------------------------
+# Каталог. Строка провайдера: @id|Название|регион|вариант|теги
+# Затем эндпоинты: "режим адрес [хост или URL]". Для dot/doh адрес — IP, к которому
+# подключаемся напрямую (системный DNS не нужен и не может подменить адрес).
+# Варианты: plain — без фильтрации, malware — защита, family — семейный, adblock — реклама.
+catalog() {
+  cat <<'EOF'
+@cloudflare|Cloudflare|global|plain|anycast
+dns4 1.1.1.1
+dns6 2606:4700:4700::1111
+dot 1.1.1.1 one.one.one.one
+doh 1.1.1.1 https://cloudflare-dns.com/dns-query
+@cloudflare-security|Cloudflare Security|global|malware|anycast
+dns4 1.1.1.2
+dns6 2606:4700:4700::1112
+dot 1.1.1.2 security.cloudflare-dns.com
+doh 1.1.1.2 https://security.cloudflare-dns.com/dns-query
+@google|Google|global|plain|anycast
+dns4 8.8.8.8
+dns6 2001:4860:4860::8888
+dot 8.8.8.8 dns.google
+doh 8.8.8.8 https://dns.google/dns-query
+@google-alt|Google Alt|global|plain|anycast,alt
+dns4 8.8.4.4
+dns6 2001:4860:4860::8844
+dot 8.8.4.4 dns.google
+doh 8.8.4.4 https://dns.google/dns-query
+@quad9|Quad9|global|malware|anycast
+dns4 9.9.9.9
+dns6 2620:fe::fe
+dot 9.9.9.9 dns.quad9.net
+doh 9.9.9.9 https://dns.quad9.net/dns-query
+@quad9-alt|Quad9 Alt|global|malware|anycast,alt
+dns4 149.112.112.112
+dns6 2620:fe::9
+dot 149.112.112.112 dns.quad9.net
+doh 149.112.112.112 https://dns.quad9.net/dns-query
+@quad9-unfiltered|Quad9 Unfiltered|global|plain|anycast
+dns4 9.9.9.10
+dns6 2620:fe::10
+dot 9.9.9.10 dns10.quad9.net
+doh 9.9.9.10 https://dns10.quad9.net/dns-query
+@adguard|AdGuard|global|adblock|anycast
+dns4 94.140.14.14
+dns6 2a10:50c0::ad1:ff
+dot 94.140.14.14 dns.adguard-dns.com
+doh 94.140.14.14 https://dns.adguard-dns.com/dns-query
+@adguard-family|AdGuard Family|global|family|anycast
+dns4 94.140.14.15
+dns6 2a10:50c0::bad1:ff
+dot 94.140.14.15 family.adguard-dns.com
+doh 94.140.14.15 https://family.adguard-dns.com/dns-query
+@cleanbrowsing-family|CleanBrowsing Family|global|family|
+dns4 185.228.168.168
+dns6 2a0d:2a00:1::
+dot 185.228.168.168 family-filter-dns.cleanbrowsing.org
+doh 185.228.168.168 https://doh.cleanbrowsing.org/doh/family-filter/
+@cleanbrowsing-security|CleanBrowsing Security|global|malware|
+dns4 185.228.168.9
+dns6 2a0d:2a00:1::2
+dot 185.228.168.9 security-filter-dns.cleanbrowsing.org
+doh 185.228.168.9 https://doh.cleanbrowsing.org/doh/security-filter/
+@controld|ControlD|global|plain|anycast
+dns4 76.76.2.0
+dns6 2606:1a40::
+dot 76.76.2.11 p0.freedns.controld.com
+doh 76.76.2.0 https://freedns.controld.com/p0
+@controld-malware|ControlD Malware|global|malware|anycast
+dns4 76.76.2.1
+dns6 2606:1a40::1
+dot 76.76.2.11 p1.freedns.controld.com
+doh 76.76.2.1 https://freedns.controld.com/p1
+@controld-uncensored|ControlD Uncensored|global|plain|anycast
+dns4 76.76.2.5
+dns6 2606:1a40::5
+dot 76.76.2.11 uncensored.freedns.controld.com
+doh 76.76.2.5 https://freedns.controld.com/uncensored
+@dnssb|DNS.SB|global|plain|anycast
+dns4 185.222.222.222
+dns6 2a09::
+dot 185.222.222.222 dot.sb
+doh 185.222.222.222 https://doh.dns.sb/dns-query
+@dnssb-alt|DNS.SB Alt|global|plain|anycast,alt
+dns4 45.11.45.11
+dns6 2a11::
+@mullvad|Mullvad|global|plain|encrypted-only
+dot 194.242.2.2 dns.mullvad.net
+doh 194.242.2.2 https://dns.mullvad.net/dns-query
+@gcore|Gcore|global|plain|
+dns4 95.85.95.85
+dns6 2a03:90c0:999d::1
+@gcore-alt|Gcore Alt|global|plain|alt
+dns4 2.56.220.2
+dns6 2a03:90c0:9992::1
+@ultradns|UltraDNS (ex-Verisign)|global|plain|unofficial
+dns4 64.6.64.6
+@ultradns-alt|UltraDNS Alt|global|plain|unofficial,alt
+dns4 64.6.65.6
+@dnswatch|DNS.WATCH|global|plain|legacy
+dns4 84.200.69.80
+dns6 2001:1608:10:25::1c04:b12f
+@dnswatch-alt|DNS.WATCH Alt|global|plain|legacy,alt
+dns4 84.200.70.40
+dns6 2001:1608:10:25::9249:d69b
+@safedns|SafeDNS|global|plain|
+dns4 195.46.39.39
+dns6 2001:67c:2778::3939
+@safedns-alt|SafeDNS Alt|global|plain|alt
+dns4 195.46.39.40
+dns6 2001:67c:2778::3940
+@uncensoreddns|UncensoredDNS|global|plain|encrypted-only
+dot 91.239.100.100 anycast.uncensoreddns.org
+doh 91.239.100.100 https://anycast.uncensoreddns.org/dns-query
+@uncensoreddns-unicast|UncensoredDNS Unicast|global|plain|encrypted-only
+dot 89.233.43.71 unicast.uncensoreddns.org
+doh 89.233.43.71 https://unicast.uncensoreddns.org/dns-query
+@opendns|OpenDNS|global|plain|
+dns4 208.67.222.222
+dns6 2620:119:35::35
+dot 208.67.222.222 dns.opendns.com
+doh 208.67.222.222 https://dns.opendns.com/dns-query
+@opendns-family|OpenDNS FamilyShield|global|family|
+dns4 208.67.222.123
+dns6 2620:119:35::123
+dot 208.67.222.123 familyshield.opendns.com
+doh 208.67.222.123 https://familyshield.opendns.com/dns-query
+@comodo|Comodo|global|plain|legacy
+dns4 8.26.56.26
+@comodo-alt|Comodo Alt|global|plain|legacy,alt
+dns4 8.20.247.20
+@level3|Level3|global|plain|legacy,unofficial
+dns4 4.2.2.1
+@level3-a|Level3 A|global|plain|legacy,unofficial
+dns4 209.244.0.3
+@level3-b|Level3 B|global|plain|legacy,unofficial
+dns4 209.244.0.4
+@nextdns|NextDNS|global|plain|anycast
+dns4 45.90.28.0
+dns6 2a07:a8c0::
+dot 45.90.28.0 dns.nextdns.io
+doh 45.90.28.0 https://dns.nextdns.io/
+@nextdns-alt|NextDNS Alt|global|plain|anycast,alt
+dns4 45.90.30.0
+dns6 2a07:a8c1::
+dot 45.90.30.0 dns.nextdns.io
+doh 45.90.30.0 https://dns.nextdns.io/
+@nwpsfi|NWPS.fi|global|adblock|
+dns4 95.217.11.63
+dns6 2a01:4f9:c012:25a0::1
+dot 95.217.11.63 public.ns.nwps.fi
+doh 95.217.11.63 https://public.ns.nwps.fi/dns-query
+@nwpsfi-kids|NWPS.fi Kids|global|family|
+dns4 135.181.103.31
+dns6 2a01:4f9:c011:aa31::1
+dot 135.181.103.31 kids.ns.nwps.fi
+doh 135.181.103.31 https://kids.ns.nwps.fi/dns-query
+@yandex|Yandex|ru|plain|
+dns4 77.88.8.8
+dns6 2a02:6b8::feed:0ff
+dot 77.88.8.8 common.dot.dns.yandex.net
+doh 77.88.8.8 https://common.dot.dns.yandex.net/dns-query
+@yandex-safe|Yandex Safe|ru|malware|
+dns4 77.88.8.88
+dns6 2a02:6b8::feed:bad
+dot 77.88.8.88 safe.dot.dns.yandex.net
+doh 77.88.8.88 https://safe.dot.dns.yandex.net/dns-query
+@yandex-family|Yandex Family|ru|family|
+dns4 77.88.8.7
+dns6 2a02:6b8::feed:a11
+dot 77.88.8.7 family.dot.dns.yandex.net
+doh 77.88.8.7 https://family.dot.dns.yandex.net/dns-query
+@comss|Comss.one|ru|adblock|
+dns4 212.109.195.93
+dot 212.109.195.93 dns.comss.one
+doh 212.109.195.93 https://dns.comss.one/dns-query
+@comss-alt|Comss.one Alt|ru|adblock|alt
+dns4 83.220.169.155
+dot 83.220.169.155 dns.comss.one
+doh 83.220.169.155 https://dns.comss.one/dns-query
+@nsdi|NSDI|ru|plain|unofficial
+dns4 195.208.4.1
+@nsdi-alt|NSDI Alt|ru|plain|unofficial,alt
+dns4 195.208.5.1
+@rostelecom|Rostelecom|ru|plain|isp
+dns4 91.122.77.189
+@mts|MTS|ru|plain|isp
+dns4 195.210.172.43
+@mts-alt|MTS Alt|ru|plain|isp,alt
+dns4 195.210.172.46
+@akado|AKADO|ru|plain|isp
+dns4 217.10.44.35
 EOF
-)
-
-DOMAINS_RU=(
-  "ya.ru"
-  "mail.ru"
-  "vk.com"
-  "ozon.ru"
-  "gosuslugi.ru"
-)
-
-DOMAINS_GLOBAL=(
-  "www.google.com"
-  "amazon.com"
-  "facebook.com"
-  "www.youtube.com"
-  "twitter.com"
-)
-
-declare -a TARGET_KEYS=()
-declare -A TARGET_EXISTS
-declare -A TARGET_PROVIDER_ID
-declare -A TARGET_NAME
-declare -A TARGET_GROUP
-declare -A TARGET_MODE
-declare -A TARGET_PUBLIC
-declare -A TARGET_FAMILY
-declare -A TARGET_CONNECT_IP
-declare -A TARGET_URL
-declare -A TARGET_HOST
-declare -A TARGET_TAGS
-
-declare -A RESULT_PROBED
-declare -A RESULT_SAMPLES
-declare -A RESULT_SUCCESS
-declare -A RESULT_FAIL
-declare -A RESULT_TOTAL
-declare -A RESULT_QUARANTINED
-declare -A RESULT_QUARANTINE_REASON
-
-declare -A QUERY_ESCAPED
-declare -A QUERY_TXID
-declare -A QUERY_LENGTH
-
-die() {
-  printf '%s\n' "$(txt error_prefix) $*" >&2
-  exit 1
 }
 
-warn() {
-  printf '%s\n' "$(txt warning_prefix) $*" >&2
+# ---------------------------------------------------------------------------
+# Тексты
+
+set_lang() {
+  if [ "$1" = ru ]; then
+    L=ru
+    M_ERROR="ошибка" M_WARN="предупреждение"
+    M_SHELL="шелл" M_TIMER="таймер" M_TRANSPORT="транспорт" M_DOMAINS="домены"
+    M_ROUNDS="раундов" M_TARGETS="целей" M_HIJACK="перехват UDP/53" M_IPV6="IPv6"
+    M_YES="есть" M_NO="нет" M_UNKNOWN="не проверить" M_NONE="недоступен"
+    M_TIMER_LOW="низкая точность"
+    M_HIJACK_WARN="Порт 53 перехватывается: корневой DNS-сервер, который не выполняет рекурсию, вернул готовый ответ. Замеры обычного DNS показывают перехватчик (роутер, VPN или провайдера), а не выбранные серверы. Запустите тест на роутере или ориентируйтесь на DoT и DoH."
+    M_HIJACK_NOTE="перехват: замер недостоверен, рейтинг не строится"
+    M_PROBE="Проверка доступности" M_ROUND="Раунд"
+    M_C_NUM="#" M_C_NAME="Провайдер" M_C_VAR="Вариант" M_C_ADDR="Адрес"
+    M_C_MED="Медиана" M_C_P90="p90" M_C_COLD="Холодный" M_C_LOSS="Потери" M_MS="мс"
+    M_N_UDP="Медиана и p90 — время ответа на запрос, мс."
+    M_N_TLS="Медиана и p90 — запрос по уже открытому TLS-соединению, как у DoT/DoH-клиента роутера. «Холодный» — новое соединение и первый запрос."
+    M_N_COLD="Клиент не держит соединение, все замеры холодные (с TLS-рукопожатием)."
+    M_N_SYS="системный резолвер, в рекомендации не попадает"
+    M_REC="Что поставить" M_NOREC="нет кандидатов без потерь"
+    M_DONE="Готово за" M_SEC="с" M_CSV_SAVED="CSV сохранён"
+    S_timeout="нет ответа" S_refused="отказ (REFUSED)" S_servfail="SERVFAIL" S_nxdomain="NXDOMAIN"
+    S_empty="пустой ответ" S_tls="ошибка TLS" S_cert="сертификат не прошёл проверку"
+    S_neterr="сетевая ошибка" S_badresp="некорректный ответ" S_h2="нужен HTTP/2" S_http="HTTP"
+    S_fail="не разрешилось"
+    Q_LANG="Язык / Language: 1) Русский  2) English"
+    Q_PROFILE="Профиль: 1) Быстрый — 3 раунда  2) Стабильность — 10 раундов"
+    Q_DOMAINS="Домены: 1) российские  2) зарубежные  3) все  4) свои"
+    Q_CUSTOM="Домены через запятую"
+    Q_PROVIDERS="Провайдеры: 1) все  2) российские  3) зарубежные  4) только системный DNS"
+    Q_MODES="Режимы через запятую: 1) DNS v4  2) DNS v6  3) DoT  4) DoH"
+    Q_DEFAULT="по умолчанию"
+  else
+    L=en
+    M_ERROR="error" M_WARN="warning"
+    M_SHELL="shell" M_TIMER="timer" M_TRANSPORT="transport" M_DOMAINS="domains"
+    M_ROUNDS="rounds" M_TARGETS="targets" M_HIJACK="UDP/53 interception" M_IPV6="IPv6"
+    M_YES="yes" M_NO="no" M_UNKNOWN="cannot check" M_NONE="unavailable"
+    M_TIMER_LOW="low resolution"
+    M_HIJACK_WARN="Port 53 is intercepted: a root DNS server, which never recurses, returned a full answer. Plain DNS results reflect the interceptor (router, VPN or ISP), not the selected servers. Run the test on the router or rely on DoT and DoH."
+    M_HIJACK_NOTE="intercepted: results are not reliable, no ranking"
+    M_PROBE="Availability check" M_ROUND="Round"
+    M_C_NUM="#" M_C_NAME="Provider" M_C_VAR="Variant" M_C_ADDR="Address"
+    M_C_MED="Median" M_C_P90="p90" M_C_COLD="Cold" M_C_LOSS="Loss" M_MS="ms"
+    M_N_UDP="Median and p90 are query response times, ms."
+    M_N_TLS="Median and p90 are queries over an already open TLS connection, as a router DoT/DoH client does. \"Cold\" is a new connection plus the first query."
+    M_N_COLD="This client cannot reuse connections, every sample is cold (includes the TLS handshake)."
+    M_N_SYS="system resolver, never recommended"
+    M_REC="What to use" M_NOREC="no candidates without losses"
+    M_DONE="Done in" M_SEC="s" M_CSV_SAVED="CSV saved"
+    S_timeout="no response" S_refused="refused" S_servfail="SERVFAIL" S_nxdomain="NXDOMAIN"
+    S_empty="empty answer" S_tls="TLS error" S_cert="certificate check failed"
+    S_neterr="network error" S_badresp="malformed response" S_h2="needs HTTP/2" S_http="HTTP"
+    S_fail="not resolved"
+    Q_LANG="Язык / Language: 1) Русский  2) English"
+    Q_PROFILE="Profile: 1) Quick — 3 rounds  2) Stability — 10 rounds"
+    Q_DOMAINS="Domains: 1) Russian  2) global  3) all  4) custom"
+    Q_CUSTOM="Comma-separated domains"
+    Q_PROVIDERS="Providers: 1) all  2) Russian  3) global  4) system DNS only"
+    Q_MODES="Comma-separated modes: 1) DNS v4  2) DNS v6  3) DoT  4) DoH"
+    Q_DEFAULT="default"
+  fi
 }
+
 
 usage() {
-  cat <<EOF
-$(txt usage_title)
-  ./${PROGRAM_NAME}
-  ./${PROGRAM_NAME} --profile quick --domains ru --providers all --modes dns4,doh,dot
+  if [ "$L" = ru ]; then
+    cat <<EOF
+dns-speedtest $VERSION — тест скорости DNS, DoT и DoH
+$PROJECT_URL
 
-$(txt usage_options)
-  --lang ru|en
-  --profile quick|stability
-  --domains ru|global|all|custom
-  --custom-domains domain1,domain2
-  --providers system|ru|global|all
-  --modes dns4,dns6,doh,dot
-  --runs N
-  --no-color
-  --help
+Запуск:  sh dnstest.sh [опции]     без опций в терминале задаёт вопросы
+
+  --modes LIST        dns4,dns6,dot,doh (по умолчанию все доступные)
+  --providers SET     all | ru | global | system (по умолчанию all)
+  --variants LIST     plain,malware,family,adblock (по умолчанию все)
+  --domains SET       ru | global | all | custom (по умолчанию ru)
+  --custom-domains L  свои домены через запятую (IDN — в punycode)
+  --profile P         quick — 3 раунда, stability — 10 раундов
+  --runs N            число раундов вместо профиля
+  --top N             строк в таблице каждого режима (0 — все)
+  --timeout SEC       таймаут UDP-запроса, для TLS +2 с (по умолчанию 1)
+  --csv FILE          сохранить сводку в CSV
+  --lang ru|en        язык (по умолчанию из \$LANG)
+  --no-color          без цвета
+  -y, --yes           не задавать вопросов
+  --list              показать каталог и выйти
+  --self-test         проверить кодировщик и парсер DNS
+  --version, -h, --help
 EOF
+  else
+    cat <<EOF
+dns-speedtest $VERSION — DNS, DoT and DoH speed test
+$PROJECT_URL
+
+Usage:  sh dnstest.sh [options]     asks questions when run in a terminal without options
+
+  --modes LIST        dns4,dns6,dot,doh (default: all available)
+  --providers SET     all | ru | global | system (default: all)
+  --variants LIST     plain,malware,family,adblock (default: all)
+  --domains SET       ru | global | all | custom (default: ru)
+  --custom-domains L  comma-separated domains (IDN in punycode)
+  --profile P         quick — 3 rounds, stability — 10 rounds
+  --runs N            number of rounds, overrides the profile
+  --top N             rows per mode table (0 — all)
+  --timeout SEC       UDP query timeout, TLS gets +2 s (default: 1)
+  --csv FILE          save the summary as CSV
+  --lang ru|en        language (default: from \$LANG)
+  --no-color          disable colors
+  -y, --yes           never ask questions
+  --list              print the catalog and exit
+  --self-test         check the DNS encoder and parser
+  --version, -h, --help
+EOF
+  fi
 }
 
-txt() {
-  local key=$1
-  local lang=${LANG_CHOICE:-en}
+# ---------------------------------------------------------------------------
+# Утилиты
 
-  case "$lang:$key" in
-    ru:error_prefix) printf '%s' "ошибка:" ;;
-    en:error_prefix) printf '%s' "error:" ;;
-    ru:warning_prefix) printf '%s' "предупреждение:" ;;
-    en:warning_prefix) printf '%s' "warning:" ;;
-    ru:usage_title) printf '%s' "Использование:" ;;
-    en:usage_title) printf '%s' "Usage:" ;;
-    ru:usage_options) printf '%s' "Опции:" ;;
-    en:usage_options) printf '%s' "Options:" ;;
-    ru:banner_title) printf '%s' " DNS Performance Benchmark v${VERSION}" ;;
-    en:banner_title) printf '%s' " DNS Performance Benchmark v${VERSION}" ;;
-    ru:step_lang) printf '%s' "Шаг 0: Выбор языка" ;;
-    en:step_lang) printf '%s' "Step 0: Select Language" ;;
-    ru:lang_ru) printf '%s' "1) Русский" ;;
-    en:lang_ru) printf '%s' "1) Russian" ;;
-    ru:lang_en) printf '%s' "2) English" ;;
-    en:lang_en) printf '%s' "2) English" ;;
-    ru:prompt_lang) printf '%s' "Выберите язык [1-2] (по умолчанию: 1): " ;;
-    en:prompt_lang) printf '%s' "Enter choice [1-2] (default: 1): " ;;
-    ru:step_profile) printf '%s' "Шаг 1: Выбор профиля" ;;
-    en:step_profile) printf '%s' "Step 1: Select Profile" ;;
-    ru:profile_quick) printf '%s' "1) Быстрый тест    (1 прогон)" ;;
-    en:profile_quick) printf '%s' "1) Quick Test      (1 run)" ;;
-    ru:profile_stability) printf '%s' "2) Тест стабильности (10 прогонов)" ;;
-    en:profile_stability) printf '%s' "2) Stability Test  (10 runs)" ;;
-    ru:prompt_profile) printf '%s' "Выберите [1-2] (по умолчанию: 1): " ;;
-    en:prompt_profile) printf '%s' "Enter choice [1-2] (default: 1): " ;;
-    ru:invalid_profile) printf '%s' "некорректный выбор профиля:" ;;
-    en:invalid_profile) printf '%s' "invalid profile choice:" ;;
-    ru:step_domains) printf '%s' "Шаг 2: Выбор набора доменов" ;;
-    en:step_domains) printf '%s' "Step 2: Select Domain Set" ;;
-    ru:domains_ru) printf '%s' "1) Российские домены" ;;
-    en:domains_ru) printf '%s' "1) Russian domains" ;;
-    ru:domains_global) printf '%s' "2) Глобальные домены" ;;
-    en:domains_global) printf '%s' "2) Global domains" ;;
-    ru:domains_all) printf '%s' "3) Все домены" ;;
-    en:domains_all) printf '%s' "3) All domains" ;;
-    ru:domains_custom) printf '%s' "4) Custom (мои домены)" ;;
-    en:domains_custom) printf '%s' "4) Custom (my domains)" ;;
-    ru:prompt_domains) printf '%s' "Выберите [1-4] (по умолчанию: 1): " ;;
-    en:prompt_domains) printf '%s' "Enter choice [1-4] (default: 1): " ;;
-    ru:prompt_custom_domains) printf '%s' "Введите один или несколько доменов через запятую: " ;;
-    en:prompt_custom_domains) printf '%s' "Enter one or more domains, comma-separated: " ;;
-    ru:invalid_domain_choice) printf '%s' "некорректный выбор доменов:" ;;
-    en:invalid_domain_choice) printf '%s' "invalid domain choice:" ;;
-    ru:step_providers) printf '%s' "Шаг 3: Выбор пула DNS-провайдеров" ;;
-    en:step_providers) printf '%s' "Step 3: Select Provider Pool" ;;
-    ru:providers_system) printf '%s' "1) Только системные резолверы" ;;
-    en:providers_system) printf '%s' "1) System resolvers only" ;;
-    ru:providers_ru) printf '%s' "2) Российские провайдеры" ;;
-    en:providers_ru) printf '%s' "2) Russian providers" ;;
-    ru:providers_global) printf '%s' "3) Глобальные провайдеры" ;;
-    en:providers_global) printf '%s' "3) Global providers" ;;
-    ru:providers_all) printf '%s' "4) Все провайдеры + системный reference" ;;
-    en:providers_all) printf '%s' "4) All providers + system reference" ;;
-    ru:prompt_providers) printf '%s' "Выберите [1-4] (по умолчанию: 4): " ;;
-    en:prompt_providers) printf '%s' "Enter choice [1-4] (default: 4): " ;;
-    ru:invalid_provider_choice) printf '%s' "некорректный выбор провайдеров:" ;;
-    en:invalid_provider_choice) printf '%s' "invalid provider choice:" ;;
-    ru:step_modes) printf '%s' "Шаг 4: Выбор режимов" ;;
-    en:step_modes) printf '%s' "Step 4: Select Modes" ;;
-    ru:prompt_modes) printf '%s' "Введите один или несколько вариантов через запятую (по умолчанию: %s): " ;;
-    en:prompt_modes) printf '%s' "Enter one or more choices (comma-separated, default: %s): " ;;
-    ru:config) printf '%s' "Конфигурация" ;;
-    en:config) printf '%s' "Configuration" ;;
-    ru:cfg_profile) printf '%s' "профиль" ;;
-    en:cfg_profile) printf '%s' "profile" ;;
-    ru:cfg_domains) printf '%s' "домены" ;;
-    en:cfg_domains) printf '%s' "domains" ;;
-    ru:cfg_providers) printf '%s' "провайдеры" ;;
-    en:cfg_providers) printf '%s' "providers" ;;
-    ru:cfg_modes) printf '%s' "режимы" ;;
-    en:cfg_modes) printf '%s' "modes" ;;
-    ru:cfg_terminal) printf '%s' "терминал" ;;
-    en:cfg_terminal) printf '%s' "terminal" ;;
-    ru:color) printf '%s' "цвет" ;;
-    en:color) printf '%s' "color" ;;
-    ru:plain) printf '%s' "plain" ;;
-    en:plain) printf '%s' "plain" ;;
-    ru:preflight_failed) printf '%s' "Preflight не пройден" ;;
-    en:preflight_failed) printf '%s' "Preflight failed" ;;
-    ru:preflight_cannot_run) printf '%s' "Текущий хост не может выполнить выбранный набор тестов:" ;;
-    en:preflight_cannot_run) printf '%s' "The current host cannot run the selected benchmark:" ;;
-    ru:preflight) printf '%s' "Preflight" ;;
-    en:preflight) printf '%s' "Preflight" ;;
-    ru:available) printf '%s' "доступен" ;;
-    en:available) printf '%s' "available" ;;
-    ru:unavailable) printf '%s' "недоступен" ;;
-    en:unavailable) printf '%s' "unavailable" ;;
-    ru:execution) printf '%s' "Выполнение" ;;
-    en:execution) printf '%s' "Execution" ;;
-    ru:run_fmt) printf '%s' "Прогон %s/%s" ;;
-    en:run_fmt) printf '%s' "Run %s/%s" ;;
-    ru:quarantine_reason) printf '%s' "initial probe failed twice; target quarantined for the rest of this run" ;;
-    en:quarantine_reason) printf '%s' "initial probe failed twice; target quarantined for the rest of this run" ;;
-    ru:final_report) printf '%s' "Итоговый отчёт" ;;
-    en:final_report) printf '%s' "Final Report" ;;
-    ru:final_hint) printf '%s' "Top-списки рекомендуют только стабильные публичные DNS для реально выбранного режима." ;;
-    en:final_hint) printf '%s' "Top lists recommend only stable public targets for the mode you actually plan to use." ;;
-    ru:system_reference) printf '%s' "Системные резолверы" ;;
-    en:system_reference) printf '%s' "System Resolver Reference" ;;
-    ru:no_system_reference) printf '%s' "Системные резолверы не участвовали в этом запуске." ;;
-    en:no_system_reference) printf '%s' "No system resolvers were part of this benchmark." ;;
-    ru:quarantined_targets) printf '%s' "Цели в карантине" ;;
-    en:quarantined_targets) printf '%s' "Quarantined Targets" ;;
-    ru:no_quarantine) printf '%s' "Ни одна цель не была помещена в карантин." ;;
-    en:no_quarantine) printf '%s' "No targets were quarantined." ;;
-    ru:no_stable_candidates) printf '%s' "Стабильных публичных кандидатов для рекомендации не найдено." ;;
-    en:no_stable_candidates) printf '%s' "No stable public candidates met the recommendation threshold." ;;
-    ru:domains_error) printf '%s' "domains must be ru, global, all, or custom" ;;
-    en:domains_error) printf '%s' "domains must be ru, global, all, or custom" ;;
-    ru:providers_error) printf '%s' "providers must be system, ru, global, or all" ;;
-    en:providers_error) printf '%s' "providers must be system, ru, global, or all" ;;
-    ru:lang_error) printf '%s' "lang must be ru or en" ;;
-    en:lang_error) printf '%s' "lang must be ru or en" ;;
-    ru:custom_required) printf '%s' "custom domains were selected, but no --custom-domains value was provided" ;;
-    en:custom_required) printf '%s' "custom domains were selected, but no --custom-domains value was provided" ;;
-    ru:no_modes_selected) printf '%s' "не выбрано ни одного режима" ;;
-    en:no_modes_selected) printf '%s' "no modes selected" ;;
-    ru:unsupported_mode_selector) printf '%s' "неподдерживаемый селектор режима:" ;;
-    en:unsupported_mode_selector) printf '%s' "unsupported mode selector:" ;;
-    ru:quick) printf '%s' "быстрый" ;;
-    en:quick) printf '%s' "quick" ;;
-    ru:stability) printf '%s' "стабильность" ;;
-    en:stability) printf '%s' "stability" ;;
-    *)
-      printf '%s' "$key"
-      ;;
+have() { command -v "$1" >/dev/null 2>&1; }
+die() { printf '%s: %s\n' "${M_ERROR:-error}" "$*" >&2; exit 1; }
+warn() { printf '%s: %s\n' "${M_WARN:-warning}" "$*" >&2; }
+
+color_init() {
+  C_RST='' C_B='' C_DIM='' C_RED='' C_GRN='' C_YEL='' C_CYN=''
+  if [ "$OPT_COLOR" = auto ]; then
+    if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then OPT_COLOR=on; else OPT_COLOR=off; fi
+  fi
+  [ "$OPT_COLOR" = on ] || return 0
+  local e
+  e=$(printf '\033')
+  C_RST="${e}[0m" C_B="${e}[1m" C_DIM="${e}[2m" C_RED="${e}[31m" C_GRN="${e}[32m" C_YEL="${e}[33m" C_CYN="${e}[36m"
+}
+
+# Таймер: NOW в микросекундах от старта. Определяется один раз, в горячем пути без fork,
+# кроме запасного варианта через date.
+timer_init() {
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    TIMER=EPOCHREALTIME
+    T0S=${EPOCHREALTIME%%[.,]*}
+    now_us() {
+      _t=$EPOCHREALTIME
+      _f=${_t#*[.,]}
+      _f=${_f#"${_f%%[!0]*}"}
+      NOW=$(( (${_t%%[.,]*} - T0S) * 1000000 + ${_f:-0} ))
+    }
+  elif { read -r _ && read -r _ && read -r _ _ _n _; } </proc/timer_list 2>/dev/null &&
+    [ -n "${_n:-}" ] && [ $((2147483647 + 1)) -gt 0 ]; then
+    TIMER=/proc/timer_list
+    now_us() {
+      { read -r _; read -r _; read -r _ _ _n _; } </proc/timer_list
+      NOW=$((_n / 1000))
+    }
+  else
+    # BusyBox без FEATURE_DATE_NANO молча выводит пустоту вместо %N: нужны ровно 9 цифр.
+    case $(date +%N 2>/dev/null) in
+      [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+      *) _nodate=1 ;;
+    esac
+    case ${_nodate:-} in
+      1)
+        if [ -r /proc/uptime ]; then
+          TIMER="/proc/uptime ($M_TIMER_LOW)"
+          now_us() {
+            read -r _u _ </proc/uptime
+            _f=${_u#*.}
+            _f=${_f#0}
+            NOW=$(( ${_u%.*} * 1000000 + ${_f:-0} * 10000 ))
+          }
+        else
+          TIMER="date +%s ($M_TIMER_LOW)"
+          now_us() { NOW=$(( $(date +%s) * 1000000 )); }
+        fi
+        ;;
+      *)
+        TIMER="date +%N"
+        T0S=$(date +%s)
+        now_us() { _d=$(date +%s%N); NOW=$(( (_d / 1000) - T0S * 1000000 )); }
+        ;;
+    esac
+  fi
+}
+
+# Собственный ГПСЧ: $RANDOM есть не во всех шеллах.
+rand16() {
+  RNG=$(( (RNG * 1103515245 + 12345) % 2147483648 ))
+  R16=$(( (RNG / 65536) % 65536 ))
+}
+
+# Сторож вместо timeout(1), которого нет в BusyBox на OpenWrt и Keenetic.
+watchdog() {
+  ( sleep "$2" & _s=$!
+    trap 'kill $_s 2>/dev/null; exit 0' TERM
+    wait $_s
+    kill "$1" 2>/dev/null ) >/dev/null 2>&1 &
+  WD=$!
+}
+cancel_watchdog() { kill "$WD" 2>/dev/null; wait "$WD" 2>/dev/null; }
+
+# Ждём, пока фоновый процесс выполнит exec и заснёт в read(), чтобы его запуск
+# не попал в замер.
+wait_exec() {
+  [ -r "/proc/$1/stat" ] || return 0
+  local i=0 st
+  while [ $i -lt 400 ]; do
+    read -r st <"/proc/$1/stat" 2>/dev/null || return 0
+    case $st in *"($2) S"*) return 0 ;; esac
+    i=$((i + 1))
+  done
+}
+
+hex_init() {
+  if have hexdump; then
+    hex_file() { hexdump -v -e '1/1 "%02x"' "$1" 2>/dev/null; }
+  elif have od; then
+    hex_file() { od -An -v -tx1 "$1" 2>/dev/null | tr -d ' \n'; }
+  else
+    die "hexdump/od"
+  fi
+}
+
+# "73.6" мс -> US=73600
+ms_to_us() {
+  local i="${1%%.*}" f=''
+  case $1 in *.*) f=${1#*.} ;; esac
+  f="${f}000"
+  f=${f%"${f#???}"}
+  f=${f#"${f%%[!0]*}"}
+  i=${i#"${i%%[!0]*}"}
+  US=$(( ${i:-0} * 1000 + ${f:-0} ))
+}
+
+# "0.073456" с -> US=73456
+sec_to_us() {
+  local i="${1%%.*}" f=''
+  case $1 in *.*) f=${1#*.} ;; esac
+  f="${f}000000"
+  f=${f%"${f#??????}"}
+  f=${f#"${f%%[!0]*}"}
+  i=${i#"${i%%[!0]*}"}
+  US=$(( ${i:-0} * 1000000 + ${f:-0} ))
+}
+
+# ---------------------------------------------------------------------------
+# DNS wire format
+
+valid_domain() {
+  case $1 in '' | *[!A-Za-z0-9.-]* | .* | *. | *..*) return 1 ;; esac
+  [ ${#1} -le 253 ] || return 1
+  local rest="$1" l
+  while [ -n "$rest" ]; do
+    l=${rest%%.*}
+    [ ${#l} -le 63 ] || return 1
+    case $rest in *.*) rest=${rest#*.} ;; *) rest= ;; esac
+  done
+}
+
+oct() { O="\\$(( $1 / 64 ))$(( $1 / 8 % 8 ))$(( $1 % 8 ))"; }
+
+# Q — printf-формат запроса типа A с RD=1, QLEN — его длина в байтах, P — 2-байтный
+# префикс длины для TCP/TLS. Без fork.
+build_query() {
+  local rest="$1" l
+  oct $(( $2 / 256 )); Q=$O
+  oct $(( $2 % 256 )); Q=$Q$O
+  Q="$Q\\001\\000\\000\\001\\000\\000\\000\\000\\000\\000"
+  while [ -n "$rest" ]; do
+    l=${rest%%.*}
+    case $rest in *.*) rest=${rest#*.} ;; *) rest= ;; esac
+    oct ${#l}; Q=$Q$O$l
+  done
+  Q="$Q\\000\\000\\001\\000\\001"
+  QLEN=$(( ${#1} + 18 ))
+  oct $(( QLEN / 256 )); P=$O
+  oct $(( QLEN % 256 )); P=$P$O
+}
+
+# Разбор заголовка ответа из hex. $2 — ожидаемый TXID в hex или пусто.
+# R_STATUS: ok | empty | nxdomain | servfail | refused | badresp
+parse_dns() {
+  local h="$1" id fl an
+  R_STATUS=badresp
+  [ ${#h} -ge 24 ] || return 1
+  id=${h%"${h#????}"}; h=${h#????}
+  fl=${h%"${h#????}"}; h=${h#????????}
+  an=${h%"${h#????}"}
+  [ -z "$2" ] || [ "$id" = "$2" ] || return 1
+  fl=$((0x$fl)); an=$((0x$an))
+  [ $((fl & 32768)) -ne 0 ] || return 1
+  case $((fl & 15)) in
+    0) if [ "$an" -gt 0 ]; then R_STATUS=ok; else R_STATUS=empty; fi ;;
+    2) R_STATUS=servfail ;;
+    3) R_STATUS=nxdomain ;;
+    5) R_STATUS=refused ;;
+  esac
+  [ "$R_STATUS" = ok ]
+}
+
+status_from_rcode() {
+  case $1 in
+    NOERROR) if [ "${2:-0}" -gt 0 ] 2>/dev/null; then R_STATUS=ok; else R_STATUS=empty; fi ;;
+    NXDOMAIN) R_STATUS=nxdomain ;;
+    SERVFAIL) R_STATUS=servfail ;;
+    REFUSED) R_STATUS=refused ;;
+    *) R_STATUS=badresp ;;
   esac
 }
 
-supports_color() {
-  if [ "$NO_COLOR_FLAG" = true ]; then
-    return 1
-  fi
-  if [ -n "${NO_COLOR-}" ]; then
-    return 1
-  fi
-  if [ -t 1 ]; then
-    return 0
-  fi
-  return 1
+# base64url запросов (ID=0, как советует RFC 8484) для DoH GET, по строке на домен.
+doh_params() {
+  awk -v list="$*" 'BEGIN {
+    A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    C = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    n = split(list, D, " ")
+    for (i = 1; i <= n; i++) {
+      nb = split("0 0 1 0 0 1 0 0 0 0 0 0", B, " ")
+      m = split(D[i], Lb, ".")
+      for (j = 1; j <= m; j++) {
+        B[++nb] = length(Lb[j])
+        for (c = 1; c <= length(Lb[j]); c++) {
+          x = index(C, substr(Lb[j], c, 1))
+          B[++nb] = x == 1 ? 45 : x <= 11 ? 46 + x : x <= 37 ? 53 + x : 59 + x
+        }
+      }
+      B[++nb] = 0; B[++nb] = 0; B[++nb] = 1; B[++nb] = 0; B[++nb] = 1
+      s = ""
+      for (k = 1; k <= nb; k += 3) {
+        v = B[k] * 65536 + (k < nb ? B[k + 1] : 0) * 256 + (k + 1 < nb ? B[k + 2] : 0)
+        s = s substr(A, int(v / 262144) % 64 + 1, 1) substr(A, int(v / 4096) % 64 + 1, 1)
+        if (k < nb) s = s substr(A, int(v / 64) % 64 + 1, 1)
+        if (k + 1 < nb) s = s substr(A, v % 64 + 1, 1)
+      }
+      print s
+    }
+  }'
 }
 
-style_text() {
-  local color=$1
-  local text=$2
+# ---------------------------------------------------------------------------
+# Окружение: какие транспорты доступны
 
-  if [ "$USE_COLOR" = true ]; then
-    printf '%b%s%b' "$color" "$text" "$NC"
+detect_env() {
+  if [ -n "${BASH_VERSION:-}" ]; then SHELL_NAME="bash $BASH_VERSION"
+  elif [ -n "${ZSH_VERSION:-}" ]; then SHELL_NAME="zsh $ZSH_VERSION"
   else
-    printf '%s' "$text"
-  fi
-}
-
-metric_label() {
-  local text=$1
-  if [ "$USE_COLOR" = true ]; then
-    printf '%b%s%b' "$CYAN" "$text" "$NC"
-  else
-    printf '%s' "$text"
-  fi
-}
-
-muted_text() {
-  local text=$1
-  if [ "$USE_COLOR" = true ]; then
-    printf '%b%s%b' "$BLUE" "$text" "$NC"
-  else
-    printf '%s' "$text"
-  fi
-}
-
-emphasis_text() {
-  local text=$1
-  if [ "$USE_COLOR" = true ]; then
-    printf '%b%s%b' "$BOLD" "$text" "$NC"
-  else
-    printf '%s' "$text"
-  fi
-}
-
-rank_badge() {
-  local rank=$1
-  local label="#${rank}"
-  local color=$BOLD
-
-  case "$rank" in
-    1) color=$GREEN ;;
-    2) color=$YELLOW ;;
-    3) color=$CYAN ;;
-  esac
-
-  style_text "$color" "[$label]"
-}
-
-section_heading() {
-  local title=$1
-  local color=$MAGENTA
-
-  if [ "$title" = "$(txt system_reference)" ]; then
-    color=$BLUE
-  elif [ "$title" = "$(txt quarantined_targets)" ]; then
-    color=$RED
+    SHELL_NAME=$(readlink "/proc/$$/exe" 2>/dev/null)
+    SHELL_NAME=${SHELL_NAME##*/}
+    [ "$SHELL_NAME" = busybox ] && SHELL_NAME="BusyBox ash"
+    : "${SHELL_NAME:=sh}"
   fi
 
-  printf '%s\n' "$(style_text "$color" "$title")"
-}
-
-status_tag() {
-  local status=$1
-  local color=$NC
-
-  case "$status" in
-    OK) color=$GREEN ;;
-    DOWN) color=$RED ;;
-    QUAR) color=$MAGENTA ;;
-    SKIP) color=$CYAN ;;
-    INFO) color=$BLUE ;;
-  esac
-
-  style_text "$color" "[$status]"
-}
-
-detect_terminal() {
-  local width=""
-
-  if [ -t 1 ]; then
-    HAS_TTY=true
-  fi
-
-  if [ -n "${COLUMNS-}" ] && [[ "${COLUMNS-}" =~ ^[0-9]+$ ]]; then
-    width=$COLUMNS
-  elif command -v tput >/dev/null 2>&1; then
-    width=$(tput cols 2>/dev/null || true)
-  fi
-
-  if ! [[ "$width" =~ ^[0-9]+$ ]]; then
-    width=80
-  fi
-
-  TERMINAL_WIDTH=$width
-  if [ "$TERMINAL_WIDTH" -lt 110 ]; then
-    COMPACT_OUTPUT=true
-  fi
-
-  if supports_color; then
-    USE_COLOR=true
-  fi
-}
-
-now_ms() {
-  if [ -n "${EPOCHREALTIME-}" ]; then
-    local raw_time=${EPOCHREALTIME/,/.}
-    local sec=${raw_time%%[.,]*}
-    local frac=${raw_time#*[.,]}
-    if [ "$frac" = "$raw_time" ]; then
-      frac="0"
-    fi
-    frac="${frac}000"
-    TIMER_SOURCE="bash:EPOCHREALTIME"
-    printf '%s\n' "$((10#$sec * 1000 + 10#${frac:0:3}))"
-    return 0
-  fi
-
-  local date_ms
-  date_ms=$(date +%s%3N 2>/dev/null || true)
-  if [[ "$date_ms" =~ ^[0-9]+$ ]]; then
-    TIMER_SOURCE="date:%s%3N"
-    printf '%s\n' "$date_ms"
-    return 0
-  fi
-
-  TIMER_SOURCE="date:%s"
-  printf '%s\n' "$(( $(date +%s) * 1000 ))"
-}
-
-seconds_to_ms() {
-  awk -v value="$1" 'BEGIN { printf "%d", (value * 1000) + 0.5 }'
-}
-
-format_percent_x10() {
-  local value=${1:-0}
-  printf '%d.%d%%' "$((value / 10))" "$((value % 10))"
-}
-
-calc_percent_x10() {
-  local success=${1:-0}
-  local total=${2:-0}
-
-  if [ "$total" -le 0 ]; then
-    printf '0\n'
-    return 0
-  fi
-
-  printf '%s\n' "$(( (success * 1000 + total / 2) / total ))"
-}
-
-join_csv() {
-  local out=""
-  local item
-
-  for item in "$@"; do
-    if [ -n "$out" ]; then
-      out+=","
-    fi
-    out+="$item"
+  CA_FILE=
+  for f in /etc/ssl/certs/ca-certificates.crt /opt/etc/ssl/certs/ca-certificates.crt \
+    /etc/ssl/cert.pem /opt/etc/ssl/cert.pem /etc/pki/tls/certs/ca-bundle.crt /jffs/ssl/certs/ca-certificates.crt; do
+    [ -r "$f" ] && { CA_FILE=$f; break; }
   done
 
-  printf '%s\n' "$out"
+  # Приоритет по точности: kdig (0,1 мс), bash /dev/udp (мкс), dig (часы ядра, на роутерах
+  # шаг 4 мс), nslookup (время запуска процесса вычитается по калибровке).
+  UDP_BACKEND=''
+  # shellcheck disable=SC3025
+  if have kdig; then UDP_BACKEND=kdig
+  elif [ -n "${BASH_VERSION:-}" ] && (exec 5<>/dev/udp/127.0.0.1/53) 2>/dev/null; then UDP_BACKEND=bash
+  elif have dig; then UDP_BACKEND=dig
+  elif have nslookup; then
+    UDP_BACKEND=nslookup
+    NSLOOKUP_BIG=0
+    case $(nslookup 2>&1) in *-type=*) NSLOOKUP_BIG=1 ;; esac
+  fi
+
+  DOT_BACKEND=
+  if have kdig; then DOT_BACKEND=kdig
+  elif have openssl && have mkfifo; then DOT_BACKEND=openssl
+  fi
+
+  DOH_BACKEND='' CURL_H2=''
+  if have curl; then
+    DOH_BACKEND=curl
+    case $(curl -V 2>/dev/null) in *HTTP2*) CURL_H2=--http2 ;; esac
+  elif have uclient-fetch; then DOH_BACKEND=uclient-fetch
+  elif have wget; then DOH_BACKEND=wget
+  fi
 }
 
-family_of_ip() {
-  case "$1" in
-    *:*) printf '%s\n' "ipv6" ;;
-    *) printf '%s\n' "ipv4" ;;
+backend_label() {
+  case $1 in
+    dns4 | dns6) BL=$UDP_BACKEND
+      [ "$BL" = nslookup ] && BL="nslookup (−$((NS_OVERHEAD / 1000)).$((NS_OVERHEAD % 1000 / 100)) $M_MS)" ;;
+    dot) BL=$DOT_BACKEND ;;
+    doh) BL=$DOH_BACKEND
+      [ "$BL" = curl ] && { [ -n "$CURL_H2" ] && BL="curl HTTP/2" || BL="curl HTTP/1.1"; } ;;
   esac
 }
 
-is_ipv6_literal() {
-  case "$1" in
-    *:*) return 0 ;;
+mode_available() {
+  case $1 in
+    dns4 | dns6) [ -n "$UDP_BACKEND" ] ;;
+    dot) [ -n "$DOT_BACKEND" ] ;;
+    doh) [ -n "$DOH_BACKEND" ] ;;
     *) return 1 ;;
   esac
 }
 
-mode_label() {
-  case "$1" in
-    dns4) printf '%s\n' "DNS v4" ;;
-    dns6) printf '%s\n' "DNS v6" ;;
-    doh) printf '%s\n' "DoH" ;;
-    dot) printf '%s\n' "DoT" ;;
-    *) printf '%s\n' "$1" ;;
-  esac
-}
-
-mode_short_label() {
-  case "$1" in
-    dns4) printf '%s\n' "DNS4" ;;
-    dns6) printf '%s\n' "DNS6" ;;
-    doh) printf '%s\n' "DoH" ;;
-    dot) printf '%s\n' "DoT" ;;
-    *) printf '%s\n' "$1" ;;
-  esac
-}
-
-mode_transport_label() {
-  local key=$1
-  local mode=${TARGET_MODE[$key]}
-  local family=${TARGET_FAMILY[$key]}
-  local base
-
-  base=$(mode_short_label "$mode")
-  case "$mode" in
-    doh|dot)
-      if [ -n "$family" ]; then
-        if [ "$family" = "ipv4" ]; then
-          printf '%s/%s\n' "$base" "4"
-        else
-          printf '%s/%s\n' "$base" "6"
-        fi
-      else
-        printf '%s\n' "$base"
-      fi
-      ;;
-    *)
-      printf '%s\n' "$base"
-      ;;
-  esac
-}
-
-sanitize_key() {
-  local value=$1
-  value=${value//[^A-Za-z0-9]/-}
-  printf '%s\n' "$value"
-}
-
-build_query_for_domain() {
-  local domain=$1
-  local txid
-  local escaped
-  local label
-  local txid_hex
-
-  if [ -n "${QUERY_ESCAPED[$domain]:-}" ]; then
-    return 0
-  fi
-
-  txid=$(( ((RANDOM << 8) ^ RANDOM) & 65535 ))
-  printf -v txid_hex '%04x' "$txid"
-  printf -v escaped '\\x%02x\\x%02x\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00' \
-    "$(( (txid >> 8) & 255 ))" "$(( txid & 255 ))"
-
-  IFS='.' read -r -a labels <<<"$domain"
-  for label in "${labels[@]}"; do
-    printf -v escaped '%s\\x%02x%s' "$escaped" "${#label}" "$label"
+# Накладные расходы на запуск nslookup: вычитаются из замеров.
+calibrate_nslookup() {
+  NS_OVERHEAD=0
+  [ "$UDP_BACKEND" = nslookup ] || return 0
+  local i=0 best=999999999 t0 pid
+  while [ $i -lt 5 ]; do
+    now_us; t0=$NOW
+    nslookup localhost 127.0.0.1 >/dev/null 2>&1 &
+    pid=$!
+    watchdog "$pid" 1
+    wait "$pid"
+    now_us
+    cancel_watchdog
+    [ $((NOW - t0)) -lt $best ] && best=$((NOW - t0))
+    i=$((i + 1))
   done
-
-  escaped+='\x00\x00\x01\x00\x01'
-  QUERY_ESCAPED[$domain]=$escaped
-  QUERY_TXID[$domain]=$txid_hex
-  QUERY_LENGTH[$domain]=$(( ${#domain} + 18 ))
+  NS_OVERHEAD=$best
 }
 
-length_prefix_escaped() {
-  local length=$1
-  printf '\\x%02x\\x%02x' "$(( (length >> 8) & 255 ))" "$(( length & 255 ))"
-}
+# ---------------------------------------------------------------------------
+# UDP: R_STATUS, R_US
 
-probe_ipv6_stack() {
-  local domain="www.google.com"
-  local response_hex=""
-
-  require_command timeout || return 1
-  build_query_for_domain "$domain"
-
-  if ! { exec {fd}<>"/dev/udp/2606:4700:4700::1111/53"; } 2>/dev/null; then
-    return 1
-  fi
-
-  printf '%b' "${QUERY_ESCAPED[$domain]}" >&"$fd" 2>/dev/null || {
-    exec {fd}>&-
-    exec {fd}<&-
-    return 1
-  }
-
-  response_hex=$(timeout "$DNS_TIMEOUT" dd bs=2 count=1 status=none <&"$fd" | od -An -tx1 | tr -d ' \n')
-  exec {fd}>&-
-  exec {fd}<&-
-
-  if [ "$response_hex" = "${QUERY_TXID[$domain]}" ]; then
-    return 0
-  fi
-
-  return 1
-}
-
-require_command() {
-  command -v "$1" >/dev/null 2>&1
-}
-
-pick_secure_endpoint() {
-  local ip4=$1
-  local ip6=$2
-
-  if [ -n "$ip4" ]; then
-    printf '%s|%s\n' "$ip4" "ipv4"
-    return 0
-  fi
-
-  if [ -n "$ip6" ] && [ "$IPV6_STACK_AVAILABLE" = true ]; then
-    printf '%s|%s\n' "$ip6" "ipv6"
-    return 0
-  fi
-
-  printf '|\n'
-}
-
-add_target() {
-  local key=$1
-  local provider_id=$2
-  local name=$3
-  local group=$4
-  local mode=$5
-  local public_flag=$6
-  local family=$7
-  local connect_ip=$8
-  local url=$9
-  local host=${10}
-  local tags=${11}
-
-  if [ -n "${TARGET_EXISTS[$key]:-}" ]; then
-    return 0
-  fi
-
-  TARGET_EXISTS[$key]=1
-  TARGET_KEYS+=("$key")
-  TARGET_PROVIDER_ID[$key]=$provider_id
-  TARGET_NAME[$key]=$name
-  TARGET_GROUP[$key]=$group
-  TARGET_MODE[$key]=$mode
-  TARGET_PUBLIC[$key]=$public_flag
-  TARGET_FAMILY[$key]=$family
-  TARGET_CONNECT_IP[$key]=$connect_ip
-  TARGET_URL[$key]=$url
-  TARGET_HOST[$key]=$host
-  TARGET_TAGS[$key]=$tags
-}
-
-build_public_targets() {
-  local row
-
-  while IFS='|' read -r id name group dns4 dns6 doh_url doh_ip4 doh_ip6 dot_host dot_ip4 dot_ip6 tags; do
-    [ -n "$id" ] || continue
-
-    case "$PROVIDERS_CHOICE" in
-      ru)
-        [ "$group" = "ru" ] || continue
-        ;;
-      global)
-        [ "$group" = "global" ] || continue
-        ;;
-      system)
-        continue
-        ;;
-      all)
-        ;;
-      *)
-        continue
-        ;;
-    esac
-
-    local mode
-    for mode in "${SELECTED_MODES[@]}"; do
-      case "$mode" in
-        dns4)
-          [ -n "$dns4" ] || continue
-          add_target "${id}::dns4" "$id" "$name" "$group" "dns4" "yes" "ipv4" "$dns4" "" "" "$tags"
-          ;;
-        dns6)
-          [ -n "$dns6" ] || continue
-          add_target "${id}::dns6" "$id" "$name" "$group" "dns6" "yes" "ipv6" "$dns6" "" "" "$tags"
-          ;;
-        doh)
-          [ -n "$doh_url" ] || continue
-          row=$(pick_secure_endpoint "$doh_ip4" "$doh_ip6")
-          local doh_connect_ip=${row%%|*}
-          local doh_family=${row##*|}
-          [ -n "$doh_connect_ip" ] || continue
-          add_target "${id}::doh" "$id" "$name" "$group" "doh" "yes" "$doh_family" "$doh_connect_ip" "$doh_url" "$(url_host "$doh_url")" "$tags"
-          ;;
-        dot)
-          [ -n "$dot_host" ] || continue
-          row=$(pick_secure_endpoint "$dot_ip4" "$dot_ip6")
-          local dot_connect_ip=${row%%|*}
-          local dot_family=${row##*|}
-          [ -n "$dot_connect_ip" ] || continue
-          add_target "${id}::dot" "$id" "$name" "$group" "dot" "yes" "$dot_family" "$dot_connect_ip" "" "$dot_host" "$tags"
-          ;;
-      esac
-    done
-  done <<<"$PROVIDER_CATALOG"
-}
-
-parse_system_resolvers() {
-  local raw_ns
-  local family
-  declare -A seen_resolver=()
-
-  [ "$PROVIDERS_CHOICE" = "system" ] || [ "$PROVIDERS_CHOICE" = "all" ] || return 0
-
-  while read -r raw_ns; do
-    [ -n "$raw_ns" ] || continue
-    [ -n "${seen_resolver[$raw_ns]:-}" ] && continue
-    seen_resolver[$raw_ns]=1
-
-    case "$raw_ns" in
-      *%*)
-        warn "skipping system resolver with zone index: $raw_ns"
-        continue
-        ;;
-    esac
-
-    family=$(family_of_ip "$raw_ns")
-
-    if mode_selected "dns4" && [ "$family" = "ipv4" ]; then
-      add_target "system-$(sanitize_key "$raw_ns")::dns4" "system-$raw_ns" "System $raw_ns" "system" "dns4" "no" "ipv4" "$raw_ns" "" "" "system"
-    fi
-
-    if mode_selected "dns6" && [ "$family" = "ipv6" ]; then
-      add_target "system-$(sanitize_key "$raw_ns")::dns6" "system-$raw_ns" "System $raw_ns" "system" "dns6" "no" "ipv6" "$raw_ns" "" "" "system"
-    fi
-  done < <(awk '/^nameserver[[:space:]]+/ { print $2 }' /etc/resolv.conf 2>/dev/null)
-}
-
-build_targets() {
-  build_public_targets
-  parse_system_resolvers
-}
-
-mode_selected() {
-  local wanted=$1
-  local mode
-  for mode in "${SELECTED_MODES[@]}"; do
-    [ "$mode" = "$wanted" ] && return 0
-  done
-  return 1
-}
-
-url_host() {
-  local url=$1
-  local rest=${url#https://}
-  rest=${rest#http://}
-  printf '%s\n' "${rest%%/*}"
-}
-
-parse_modes() {
-  local raw=$1
-  local token
-  local want_dns4=0
-  local want_dns6=0
-  local want_doh=0
-  local want_dot=0
-
-  raw=${raw//,/ }
-
-  for token in $raw; do
-    case "$token" in
-      1|dns4|DNS4) want_dns4=1 ;;
-      2|dns6|DNS6) want_dns6=1 ;;
-      3|doh|DOH|DoH) want_doh=1 ;;
-      4|dot|DOT|DoT) want_dot=1 ;;
-      "")
-        ;;
-      *)
-        die "$(txt unsupported_mode_selector) $token"
-        ;;
-    esac
-  done
-
-  SELECTED_MODES=()
-  [ "$want_dns4" -eq 1 ] && SELECTED_MODES+=("dns4")
-  [ "$want_dns6" -eq 1 ] && SELECTED_MODES+=("dns6")
-  [ "$want_doh" -eq 1 ] && SELECTED_MODES+=("doh")
-  [ "$want_dot" -eq 1 ] && SELECTED_MODES+=("dot")
-
-  [ "${#SELECTED_MODES[@]}" -gt 0 ] || die "$(txt no_modes_selected)"
-}
-
-validate_choice() {
-  local value=$1
-  shift
-  local allowed
-  for allowed in "$@"; do
-    [ "$value" = "$allowed" ] && return 0
-  done
-  return 1
-}
-
-parse_args() {
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --lang)
-        [ "$#" -ge 2 ] || die "--lang requires a value"
-        LANG_CHOICE=$2
-        shift 2
-        ;;
-      --profile)
-        [ "$#" -ge 2 ] || die "--profile requires a value"
-        PROFILE=$2
-        shift 2
-        ;;
-      --domains)
-        [ "$#" -ge 2 ] || die "--domains requires a value"
-        DOMAINS_CHOICE=$2
-        shift 2
-        ;;
-      --custom-domains)
-        [ "$#" -ge 2 ] || die "--custom-domains requires a value"
-        CUSTOM_DOMAINS_RAW=$2
-        shift 2
-        ;;
-      --providers)
-        [ "$#" -ge 2 ] || die "--providers requires a value"
-        PROVIDERS_CHOICE=$2
-        shift 2
-        ;;
-      --modes)
-        [ "$#" -ge 2 ] || die "--modes requires a value"
-        parse_modes "$2"
-        shift 2
-        ;;
-      --runs)
-        [ "$#" -ge 2 ] || die "--runs requires a value"
-        RUNS=$2
-        shift 2
-        ;;
-      --no-color)
-        NO_COLOR_FLAG=true
-        shift
-        ;;
-      --help|-h)
-        usage
-        exit 0
-        ;;
-      *)
-        die "unknown argument: $1"
-        ;;
-    esac
-  done
-}
-
-trim_whitespace() {
-  local value=$1
-  value=${value#"${value%%[![:space:]]*}"}
-  value=${value%"${value##*[![:space:]]}"}
-  printf '%s\n' "$value"
-}
-
-parse_custom_domains() {
-  local raw=$1
-  local token
-
-  SELECTED_DOMAINS=()
-  raw=${raw//,/ }
-
-  for token in $raw; do
-    token=$(trim_whitespace "$token")
-    [ -n "$token" ] || continue
-    SELECTED_DOMAINS+=("$token")
-  done
-
-  [ "${#SELECTED_DOMAINS[@]}" -gt 0 ] || die "$(txt custom_required)"
-}
-
-interactive_pick() {
-  local prompt=$1
-  local default_value=$2
-  local answer=""
-
-  read -r -p "$prompt" answer
-  if [ -z "$answer" ]; then
-    printf '%s\n' "$default_value"
-  else
-    printf '%s\n' "$answer"
-  fi
-}
-
-run_interactive_setup() {
-  local answer
-  local default_modes="1,3,4"
-
-  if [ "$IPV6_STACK_AVAILABLE" = true ]; then
-    default_modes="1,2,3,4"
-  fi
-
-  printf '%s\n' "$(style_text "$YELLOW" "$(txt step_lang)")"
-  printf '%s\n' "$(txt lang_ru)"
-  printf '%s\n' "$(txt lang_en)"
-  answer=$(interactive_pick "$(txt prompt_lang)" "1")
-  case "$answer" in
-    1|ru|RU) LANG_CHOICE="ru" ;;
-    2|en|EN) LANG_CHOICE="en" ;;
-    *) LANG_CHOICE="ru" ;;
-  esac
-  printf '\n'
-
-  print_banner
-  printf '%s\n' "$(style_text "$YELLOW" "$(txt step_profile)")"
-  printf '%s\n' "$(txt profile_quick)"
-  printf '%s\n' "$(txt profile_stability)"
-  answer=$(interactive_pick "$(txt prompt_profile)" "1")
-  case "$answer" in
-    1) PROFILE="quick" ;;
-    2) PROFILE="stability" ;;
-    *) die "$(txt invalid_profile) $answer" ;;
-  esac
-  printf '\n'
-
-  printf '%s\n' "$(style_text "$YELLOW" "$(txt step_domains)")"
-  printf '%s\n' "$(txt domains_ru)"
-  printf '%s\n' "$(txt domains_global)"
-  printf '%s\n' "$(txt domains_all)"
-  printf '%s\n' "$(txt domains_custom)"
-  answer=$(interactive_pick "$(txt prompt_domains)" "1")
-  case "$answer" in
-    1) DOMAINS_CHOICE="ru" ;;
-    2) DOMAINS_CHOICE="global" ;;
-    3) DOMAINS_CHOICE="all" ;;
-    4) DOMAINS_CHOICE="custom" ;;
-    *) die "$(txt invalid_domain_choice) $answer" ;;
-  esac
-  if [ "$DOMAINS_CHOICE" = "custom" ]; then
-    CUSTOM_DOMAINS_RAW=$(interactive_pick "$(txt prompt_custom_domains)" "")
-  fi
-  printf '\n'
-
-  printf '%s\n' "$(style_text "$YELLOW" "$(txt step_providers)")"
-  printf '%s\n' "$(txt providers_system)"
-  printf '%s\n' "$(txt providers_ru)"
-  printf '%s\n' "$(txt providers_global)"
-  printf '%s\n' "$(txt providers_all)"
-  answer=$(interactive_pick "$(txt prompt_providers)" "4")
-  case "$answer" in
-    1) PROVIDERS_CHOICE="system" ;;
-    2) PROVIDERS_CHOICE="ru" ;;
-    3) PROVIDERS_CHOICE="global" ;;
-    4) PROVIDERS_CHOICE="all" ;;
-    *) die "$(txt invalid_provider_choice) $answer" ;;
-  esac
-  printf '\n'
-
-  printf '%s\n' "$(style_text "$YELLOW" "$(txt step_modes)")"
-  printf '%s\n' "1) DNS v4"
-  printf '%s\n' "2) DNS v6"
-  printf '%s\n' "3) DoH"
-  printf '%s\n' "4) DoT"
-  printf -v answer_prompt "$(txt prompt_modes)" "$default_modes"
-  answer=$(interactive_pick "$answer_prompt" "$default_modes")
-  parse_modes "$answer"
-}
-
-finalize_profile_and_runs() {
-  if [ -z "$PROFILE" ]; then
-    PROFILE="quick"
-  fi
-
-  validate_choice "$PROFILE" quick stability || die "profile must be quick or stability"
-
-  if [ -z "$RUNS" ]; then
-    if [ "$PROFILE" = "quick" ]; then
-      RUNS=$DEFAULT_QUICK_RUNS
-    else
-      RUNS=$DEFAULT_STABILITY_RUNS
-    fi
-  fi
-
-  [[ "$RUNS" =~ ^[0-9]+$ ]] || die "--runs must be a positive integer"
-  [ "$RUNS" -ge 1 ] || die "--runs must be at least 1"
-
-  if [ "$RUNS" -gt 1 ]; then
-    PROFILE="stability"
-  fi
-}
-
-select_domains() {
-  case "$DOMAINS_CHOICE" in
-    ru)
-      SELECTED_DOMAINS=("${DOMAINS_RU[@]}")
-      ;;
-    global)
-      SELECTED_DOMAINS=("${DOMAINS_GLOBAL[@]}")
-      ;;
-    all)
-      SELECTED_DOMAINS=("${DOMAINS_RU[@]}" "${DOMAINS_GLOBAL[@]}")
-      ;;
-    custom)
-      parse_custom_domains "$CUSTOM_DOMAINS_RAW"
-      ;;
-    *)
-      die "$(txt domains_error)"
-      ;;
+udp_query() {
+  R_STATUS=timeout R_US=0
+  case $UDP_BACKEND in
+    dig) udp_dig "$1" "$2" ;;
+    kdig) udp_kdig "$1" "$2" ;;
+    bash) udp_bash "$1" "$2" ;;
+    nslookup) udp_nslookup "$1" "$2" ;;
   esac
 }
 
-print_banner() {
-  printf '%s\n' "$(style_text "$GREEN" "  ____  _   _ ____  ____  _____ ____  _____ _____ ____  _____ ")"
-  printf '%s\n' "$(style_text "$GREEN" " |  _ \\| \\ | / ___||  _ \\| ____|  _ \\|  ___|_   _| ____|/ ___|")"
-  printf '%s\n' "$(style_text "$GREEN" " | | | |  \\| \\___ \\| |_) |  _| | |_) | |_    | | |  _|  \\___ \\")"
-  printf '%s\n' "$(style_text "$GREEN" " | |_| | |\\  |___) |  __/| |___|  _ <|  _|   | | | |___  ___) |")"
-  printf '%s\n' "$(style_text "$GREEN" " |____/|_| \\_|____/|_|   |_____|_| \\_\\_|     |_| |_____||____/ ")"
-  printf '%s\n' "$(txt banner_title)"
-  printf '%s\n' "================================================================"
+udp_dig() {
+  local out st an qt
+  out=$(dig +tries=1 +time="$OPT_TIMEOUT" +noall +comments +stats @"$1" "$2" A 2>&1)
+  case $out in
+    *"status: "*) st=${out#*status: }; st=${st%%,*} ;;
+    *"refused"* | *"unreachable"*) R_STATUS=neterr; return ;;
+    *) return ;;
+  esac
+  an=${out#*ANSWER: }; an=${an%%,*}
+  qt=${out#*Query time: }; qt=${qt%% *}
+  status_from_rcode "$st" "$an"
+  case $qt in '' | *[!0-9]*) qt=0 ;; esac
+  R_US=$((qt * 1000))
 }
 
-print_selection_summary() {
-  local modes_csv
-  modes_csv=$(join_csv "${SELECTED_MODES[@]}")
-
-  printf '\n'
-  printf '%s\n' "$(style_text "$BOLD" "$(txt config)")"
-  printf '  %-12s %s\n' "$(txt cfg_profile)" "$( [ "$PROFILE" = "quick" ] && printf '%s' "$(txt quick)" || printf '%s' "$(txt stability)" ) (${RUNS} run$( [ "$RUNS" -eq 1 ] && printf '' || printf 's'))"
-  printf '  %-12s %s\n' "$(txt cfg_domains)" "$( [ "$DOMAINS_CHOICE" = "custom" ] && printf 'custom (%s)' "$(join_csv "${SELECTED_DOMAINS[@]}")" || printf '%s' "$DOMAINS_CHOICE" )"
-  printf '  %-12s %s\n' "$(txt cfg_providers)" "$PROVIDERS_CHOICE"
-  printf '  %-12s %s\n' "$(txt cfg_modes)" "$modes_csv"
-  printf '  %-12s %s\n' "$(txt cfg_terminal)" "${TERMINAL_WIDTH} cols, $( [ "$USE_COLOR" = true ] && printf '%s' "$(txt color)" || printf '%s' "$(txt plain)" )"
+udp_kdig() {
+  local out st an ms
+  out=$(kdig @"$1" +notcp +timeout="$OPT_TIMEOUT" +retry=0 +noall +header +stats "$2" A 2>&1)
+  case $out in
+    *"status: "*) st=${out#*status: }; st=${st%%;*} ;;
+    *"refused"* | *"unreachable"*) R_STATUS=neterr; return ;;
+    *) return ;;
+  esac
+  an=${out#*ANSWER: }; an=${an%%;*}
+  ms=${out##* in }; ms=${ms%% ms*}
+  status_from_rcode "$st" "$an"
+  ms_to_us "$ms"
+  R_US=$US
 }
 
-run_preflight() {
-  local issues=()
-  local target_count=0
-  local mode
-
-  require_command awk || issues+=("awk is required")
-  require_command sort || issues+=("sort is required")
-  require_command od || issues+=("od is required")
-  require_command dd || issues+=("dd is required")
-  if mode_selected "dns4" || mode_selected "dns6" || mode_selected "dot"; then
-    require_command timeout || issues+=("timeout is required for strict socket timeouts")
-  fi
-
-  if mode_selected "doh"; then
-    require_command curl || issues+=("curl is required for DoH mode")
-  fi
-
-  if mode_selected "dot"; then
-    require_command openssl || issues+=("openssl is required for DoT mode")
-  fi
-
-  if mode_selected "dns6" && [ "$IPV6_STACK_AVAILABLE" != true ]; then
-    issues+=("IPv6 transport was selected, but this host cannot reach an IPv6 resolver")
-  fi
-
-  [ "${#TARGET_KEYS[@]}" -gt 0 ] || issues+=("no targets were built for the selected provider pool and modes")
-
-  if [ "${#issues[@]}" -gt 0 ]; then
-    printf '\n'
-    printf '%s\n' "$(style_text "$RED" "$(txt preflight_failed)")"
-    printf '%s\n' "$(txt preflight_cannot_run)"
-    local issue
-    for issue in "${issues[@]}"; do
-      printf '  - %s\n' "$issue"
-    done
-    exit 1
-  fi
-
-  printf '\n'
-  printf '%s\n' "$(style_text "$BOLD" "$(txt preflight)")"
-  printf '  %-12s %s\n' "timer" "$TIMER_SOURCE"
-  printf '  %-12s %s\n' "ipv6" "$( [ "$IPV6_STACK_AVAILABLE" = true ] && printf '%s' "$(txt available)" || printf '%s' "$(txt unavailable)" )"
-  printf '  %-12s %s\n' "curl" "$( require_command curl && printf 'yes' || printf 'no' )"
-  printf '  %-12s %s\n' "openssl" "$( require_command openssl && printf 'yes' || printf 'no' )"
-  printf '  %-12s %s\n' "timeout" "$( require_command timeout && printf 'yes' || printf 'no' )"
-
-  for mode in "${SELECTED_MODES[@]}"; do
-    target_count=0
-    local key
-    for key in "${TARGET_KEYS[@]}"; do
-      [ "${TARGET_MODE[$key]}" = "$mode" ] || continue
-      target_count=$((target_count + 1))
-    done
-    printf '  %-12s %s target(s)\n' "$(mode_label "$mode")" "$target_count"
-  done
-}
-
-record_success() {
-  local key=$1
-  local latency=$2
-
-  RESULT_SUCCESS[$key]=$(( ${RESULT_SUCCESS[$key]:-0} + 1 ))
-  RESULT_TOTAL[$key]=$(( ${RESULT_TOTAL[$key]:-0} + 1 ))
-
-  if [ -n "${RESULT_SAMPLES[$key]:-}" ]; then
-    RESULT_SAMPLES[$key]+=" $latency"
-  else
-    RESULT_SAMPLES[$key]="$latency"
-  fi
-}
-
-record_failure() {
-  local key=$1
-  RESULT_FAIL[$key]=$(( ${RESULT_FAIL[$key]:-0} + 1 ))
-  RESULT_TOTAL[$key]=$(( ${RESULT_TOTAL[$key]:-0} + 1 ))
-}
-
-quarantine_target() {
-  local key=$1
-  local reason=$2
-  RESULT_QUARANTINED[$key]=1
-  RESULT_QUARANTINE_REASON[$key]=$reason
-}
-
-resolve_dns_udp() {
-  local server_ip=$1
-  local domain=$2
-  local start_ms
-  local end_ms
-  local response_hex=""
-
-  require_command timeout || return 1
-  build_query_for_domain "$domain"
-
-  if ! exec {fd}<>"/dev/udp/${server_ip}/53" 2>/dev/null; then
-    return 1
-  fi
-
-  start_ms=$(now_ms)
-  if ! printf '%b' "${QUERY_ESCAPED[$domain]}" >&"$fd" 2>/dev/null; then
-    exec {fd}>&-
-    exec {fd}<&-
-    return 1
-  fi
-
-  response_hex=$(timeout "$DNS_TIMEOUT" dd bs=2 count=1 status=none <&"$fd" | od -An -tx1 | tr -d ' \n')
-  end_ms=$(now_ms)
-  exec {fd}>&-
-  exec {fd}<&-
-
-  if [ "$response_hex" = "${QUERY_TXID[$domain]}" ] && [ -n "$response_hex" ]; then
-    printf '%s\n' "$((end_ms - start_ms))"
-    return 0
-  fi
-
-  return 1
-}
-
-resolve_doh() {
-  local url=$1
-  local connect_ip=$2
-  local domain=$3
-  local host
-  local metrics=""
-  local resolve_arg=()
-  local http_code=0
-  local size_download=0
-  local time_total=0
-
-  host=$(url_host "$url")
-  build_query_for_domain "$domain"
-
-  if [ -n "$connect_ip" ]; then
-    if is_ipv6_literal "$connect_ip"; then
-      resolve_arg=(--resolve "${host}:443:[${connect_ip}]")
-    else
-      resolve_arg=(--resolve "${host}:443:${connect_ip}")
-    fi
-  fi
-
-  metrics=$(printf '%b' "${QUERY_ESCAPED[$domain]}" | curl -sS --max-time "$DOH_TIMEOUT" \
-    "${resolve_arg[@]}" \
-    -o /dev/null \
-    -w '%{http_code}|%{size_download}|%{time_total}' \
-    -H 'Content-Type: application/dns-message' \
-    -H 'Accept: application/dns-message' \
-    --data-binary @- \
-    "$url" 2>/dev/null || true)
-
-  IFS='|' read -r http_code size_download time_total <<<"$metrics"
-
-  if [[ "$http_code" =~ ^2[0-9][0-9]$ ]] && [ "${size_download:-0}" -gt 0 ]; then
-    seconds_to_ms "${time_total:-0}"
-    return 0
-  fi
-
-  return 1
-}
-
-resolve_dot() {
-  local connect_ip=$1
-  local servername=$2
-  local domain=$3
-  local connect_target
-  local prefix_escaped
-  local header_hex=""
-  local start_ms
-  local end_ms
-
-  require_command timeout || return 1
-  build_query_for_domain "$domain"
-  prefix_escaped=$(length_prefix_escaped "${QUERY_LENGTH[$domain]}")
-
-  connect_target="${connect_ip}:853"
-  if is_ipv6_literal "$connect_ip"; then
-    connect_target="[${connect_ip}]:853"
-  fi
-
-  start_ms=$(now_ms)
-  exec {fd}< <(
-    timeout "$DOT_TIMEOUT" bash -c '
-      printf "%b" "$1$2" | openssl s_client -connect "$3" -servername "$4" -quiet 2>/dev/null
-    ' _ "$prefix_escaped" "${QUERY_ESCAPED[$domain]}" "$connect_target" "$servername" 2>/dev/null
+udp_bash() {
+  local f="$TMPD/udp.$JOB" res rc us
+  rand16
+  build_query "$2" "$R16"
+  # В подоболочке: ошибка exec с /dev/udp не должна завершить основной шелл.
+  # shellcheck disable=SC3025
+  res=$(
+    exec 5<>"/dev/udp/$1/53" 2>/dev/null || { echo neterr; exit 0; }
+    dd bs=4096 count=1 <&5 >"$f" 2>/dev/null &
+    pid=$!
+    wait_exec "$pid" dd
+    now_us; t0=$NOW
+    printf "$Q" >&5 2>/dev/null || { kill "$pid" 2>/dev/null; echo neterr; exit 0; }
+    watchdog "$pid" "$OPT_TIMEOUT"
+    wait "$pid"; rc=$?
+    now_us
+    cancel_watchdog
+    echo "$rc $((NOW - t0))"
   )
-  header_hex=$(timeout "$DOT_TIMEOUT" dd bs=4 count=1 status=none <&"$fd" | od -An -tx1 | tr -d ' \n')
-  exec {fd}<&-
-  end_ms=$(now_ms)
-
-  if [ "${#header_hex}" -ge 8 ] && [ "${header_hex:4:4}" = "${QUERY_TXID[$domain]}" ]; then
-    printf '%s\n' "$((end_ms - start_ms))"
-    return 0
-  fi
-
-  return 1
+  case $res in neterr) R_STATUS=neterr; return ;; esac
+  rc=${res%% *} us=${res#* }
+  [ "$rc" = 0 ] || return
+  parse_dns "$(hex_file "$f")" "$(printf '%04x' "$R16")"
+  R_US=$us
 }
 
-run_single_query() {
-  local key=$1
-  local domain=$2
-  local mode=${TARGET_MODE[$key]}
-
-  case "$mode" in
-    dns4|dns6)
-      resolve_dns_udp "${TARGET_CONNECT_IP[$key]}" "$domain"
-      ;;
-    doh)
-      resolve_doh "${TARGET_URL[$key]}" "${TARGET_CONNECT_IP[$key]}" "$domain"
-      ;;
-    dot)
-      resolve_dot "${TARGET_CONNECT_IP[$key]}" "${TARGET_HOST[$key]}" "$domain"
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-avg_from_samples() {
-  local samples=$1
-  local sum=0
-  local count=0
-  local value
-
-  for value in $samples; do
-    sum=$((sum + value))
-    count=$((count + 1))
-  done
-
-  if [ "$count" -le 0 ]; then
-    printf '0\n'
-    return 0
-  fi
-
-  printf '%s\n' "$(( (sum + count / 2) / count ))"
-}
-
-compute_stats() {
-  local key=$1
-  local samples=${RESULT_SAMPLES[$key]:-}
-  local success=${RESULT_SUCCESS[$key]:-0}
-  local total=${RESULT_TOTAL[$key]:-0}
-  local -a sorted_samples=()
-  local sorted
-  local count=0
-  local mid_left=0
-  local mid_right=0
-  local median=0
-  local p90=0
-  local avg=0
-  local success_rate_x10=0
-  local p90_index=0
-
-  if [ -n "$samples" ]; then
-    mapfile -t sorted_samples < <(printf '%s\n' $samples | sort -n)
-    count=${#sorted_samples[@]}
-  fi
-
-  if [ "$count" -gt 0 ]; then
-    avg=$(avg_from_samples "$samples")
-    mid_left=$(( (count - 1) / 2 ))
-    mid_right=$(( count / 2 ))
-    median=$(( (sorted_samples[$mid_left] + sorted_samples[$mid_right] + 1) / 2 ))
-    p90_index=$(( (count * 9 + 9) / 10 - 1 ))
-    [ "$p90_index" -lt 0 ] && p90_index=0
-    p90=${sorted_samples[$p90_index]}
-  fi
-
-  success_rate_x10=$(calc_percent_x10 "$success" "$total")
-  printf '%s|%s|%s|%s|%s|%s\n' "$median" "$avg" "$p90" "$success" "$total" "$success_rate_x10"
-}
-
-render_run_line() {
-  local key=$1
-  local status=$2
-  local ok_count=$3
-  local total_count=$4
-  local avg_ms=$5
-  local extra=$6
-
-  local tag
-  tag=$(status_tag "$status")
-
-  if [ "$COMPACT_OUTPUT" = true ]; then
-    printf '%s %-6s %-22s ok %2d/%-2d avg %4sms %s\n' \
-      "$tag" \
-      "$(mode_transport_label "$key")" \
-      "${TARGET_NAME[$key]}" \
-      "$ok_count" \
-      "$total_count" \
-      "$avg_ms" \
-      "$extra"
+udp_nslookup() {
+  local f="$TMPD/ns.$JOB" pid t0 line name=0 addr=0
+  now_us; t0=$NOW
+  if [ "$NSLOOKUP_BIG" = 1 ]; then
+    nslookup -type=a "$2" "$1" >"$f" 2>&1 &
   else
-    printf '%s %-7s %-28s %-7s ok %2d/%-2d avg %4sms %s\n' \
-      "$tag" \
-      "$(mode_transport_label "$key")" \
-      "${TARGET_NAME[$key]}" \
-      "$( [ "${TARGET_PUBLIC[$key]}" = "yes" ] && printf 'public' || printf 'system' )" \
-      "$ok_count" \
-      "$total_count" \
-      "$avg_ms" \
-      "$extra"
+    nslookup "$2" "$1" >"$f" 2>&1 &
   fi
-}
-
-test_target() {
-  local key=$1
-  local successes_this_run=0
-  local failures_this_run=0
-  local first_domain_consumed=0
-  local total_domains=${#SELECTED_DOMAINS[@]}
-  local latency=""
-  local average_this_run=0
-  local domain
-  local index
-  local run_samples=""
-
-  if [ "${RESULT_QUARANTINED[$key]:-0}" -eq 1 ]; then
-    return 0
-  fi
-
-  if [ "${RESULT_PROBED[$key]:-0}" -eq 0 ]; then
-    domain=${SELECTED_DOMAINS[0]}
-    latency=$(run_single_query "$key" "$domain" 2>/dev/null || true)
-    if [[ "$latency" =~ ^[0-9]+$ ]]; then
-      record_success "$key" "$latency"
-      successes_this_run=$((successes_this_run + 1))
-      first_domain_consumed=1
-      run_samples="$latency"
-    else
-      latency=$(run_single_query "$key" "$domain" 2>/dev/null || true)
-      if [[ "$latency" =~ ^[0-9]+$ ]]; then
-        record_success "$key" "$latency"
-        successes_this_run=$((successes_this_run + 1))
-        first_domain_consumed=1
-        run_samples="$latency"
-      else
-        record_failure "$key"
-        failures_this_run=1
-        quarantine_target "$key" "$(txt quarantine_reason)"
-        RESULT_PROBED[$key]=1
-        render_run_line "$key" "QUAR" "$successes_this_run" "1" "0" "$(txt quarantine_reason)"
-        return 0
-      fi
-    fi
-    RESULT_PROBED[$key]=1
-  fi
-
-  for ((index = first_domain_consumed; index < total_domains; index++)); do
-    domain=${SELECTED_DOMAINS[$index]}
-    latency=$(run_single_query "$key" "$domain" 2>/dev/null || true)
-    if [[ "$latency" =~ ^[0-9]+$ ]]; then
-      record_success "$key" "$latency"
-      successes_this_run=$((successes_this_run + 1))
-      if [ -n "$run_samples" ]; then
-        run_samples+=" $latency"
-      else
-        run_samples="$latency"
-      fi
-    else
-      record_failure "$key"
-      failures_this_run=$((failures_this_run + 1))
-    fi
-  done
-
-  if [ "$successes_this_run" -gt 0 ]; then
-    average_this_run=$(avg_from_samples "$run_samples")
-  fi
-
-  if [ "$failures_this_run" -gt 0 ]; then
-    render_run_line "$key" "DOWN" "$successes_this_run" "$total_domains" "$average_this_run" "$(printf 'failures %d' "$failures_this_run")"
-  else
-    render_run_line "$key" "OK" "$successes_this_run" "$total_domains" "$average_this_run" ""
-  fi
-}
-
-render_recommendation_reason() {
-  local mode=$1
-  local rank=$2
-  local median=$3
-  local p90=$4
-  local success_rate_x10=$5
-  local jitter=$((p90 - median))
-
-  if [ "$rank" -eq 1 ]; then
-    case "$mode" in
-      doh|dot)
-        printf '%s\n' "best encrypted balance"
-        ;;
-      *)
-        printf '%s\n' "fastest stable"
-        ;;
+  pid=$!
+  watchdog "$pid" "$OPT_TIMEOUT"
+  wait "$pid"
+  now_us
+  cancel_watchdog
+  R_US=$((NOW - t0 - NS_OVERHEAD))
+  [ "$R_US" -lt 0 ] && R_US=0
+  R_STATUS=badresp
+  while IFS= read -r line; do
+    case $line in
+      *"NXDOMAIN"*) R_STATUS=nxdomain; return ;;
+      *"SERVFAIL"*) R_STATUS=servfail; return ;;
+      *"REFUSED"*) R_STATUS=refused; return ;;
+      *"timed out"* | *"no servers could be reached"*) R_STATUS=timeout; return ;;
+      *nreachable* | *"can't connect"* | *"connection refused"*) R_STATUS=neterr; return ;;
+      Name:*) name=1 ;;
+      Address*) [ "$name" = 1 ] && addr=1 ;;
     esac
-    return 0
-  fi
-
-  if [ "$jitter" -le 10 ]; then
-    printf '%s\n' "lowest jitter"
-  elif [ "$success_rate_x10" -ge 1000 ]; then
-    printf '%s\n' "clean fallback"
-  else
-    printf '%s\n' "strong fallback"
-  fi
+  done <"$f"
+  # Маленький nslookup (через libc) код ответа не показывает: только «не разрешилось».
+  if [ "$addr" = 1 ]; then R_STATUS=ok; elif [ -s "$f" ]; then R_STATUS=fail; else R_STATUS=timeout; fi
 }
 
-render_target_setup() {
-  local key=$1
-  local mode=${TARGET_MODE[$key]}
-  local family=${TARGET_FAMILY[$key]}
-  local connect_ip=${TARGET_CONNECT_IP[$key]}
-  local url=${TARGET_URL[$key]}
-  local host=${TARGET_HOST[$key]}
+# ---------------------------------------------------------------------------
+# Сессии DoT/DoH: все домены по одному соединению. Первый запрос — cold, остальные — warm.
+# Запись результата: key round domain phase status us
 
-  case "$mode" in
-    dns4|dns6)
-      printf 'DNS: %s\n' "$connect_ip"
-      ;;
-    doh)
-      if [ -n "$connect_ip" ]; then
-        printf 'DoH: %s | connect %s (%s)\n' "$url" "$connect_ip" "$family"
-      else
-        printf 'DoH: %s\n' "$url"
-      fi
-      ;;
-    dot)
-      if [ -n "$connect_ip" ]; then
-        printf 'DoT: %s | connect %s (%s)\n' "$host" "$connect_ip" "$family"
-      else
-        printf 'DoT: %s\n' "$host"
-      fi
-      ;;
-    *)
-      printf '%s\n' "$connect_ip"
-      ;;
+emit() { printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >>"$OUT"; }
+
+phase_of() { if [ "$1" -eq 1 ]; then PHASE=cold; else PHASE=warm; fi; }
+
+# Запросы сессии после обрыва соединения засчитываются как потери с той же причиной.
+emit_rest() { # key round status from domains...
+  local key="$1" round="$2" status="$3" from="$4" i=0 d
+  shift 4
+  for d in "$@"; do
+    i=$((i + 1))
+    [ $i -lt "$from" ] && continue
+    phase_of $i
+    emit "$key" "$round" "$d" "$PHASE" "$status" 0
+  done
+}
+
+session() { # key mode addr endpoint round domains...
+  local key="$1" mode="$2" addr="$3" ep="$4" round="$5"
+  shift 5
+  case $mode in
+    dot) case $DOT_BACKEND in kdig) dot_kdig "$key" "$addr" "$ep" "$round" "$@" ;; openssl) dot_openssl "$key" "$addr" "$ep" "$round" "$@" ;; esac ;;
+    doh) case $DOH_BACKEND in curl) doh_curl "$key" "$addr" "$ep" "$round" "$@" ;; *) doh_fetch "$key" "$addr" "$ep" "$round" "$@" ;; esac ;;
   esac
 }
 
-render_mode_top() {
-  local mode=$1
-  local threshold_x10=1000
-  local records=()
-  local key
-  local stats
-  local median
-  local avg
-  local p90
-  local success
-  local total
-  local success_rate_x10
-  local line
-  local setup
-  local rank=0
-
-  if [ "$PROFILE" = "stability" ]; then
-    threshold_x10=950
-  fi
-
-  for key in "${TARGET_KEYS[@]}"; do
-    [ "${TARGET_MODE[$key]}" = "$mode" ] || continue
-    [ "${TARGET_PUBLIC[$key]}" = "yes" ] || continue
-    [ "${RESULT_QUARANTINED[$key]:-0}" -eq 0 ] || continue
-
-    stats=$(compute_stats "$key")
-    IFS='|' read -r median avg p90 success total success_rate_x10 <<<"$stats"
-
-    [ "$success" -gt 0 ] || continue
-    [ "$success_rate_x10" -ge "$threshold_x10" ] || continue
-
-    records+=("$(printf '%010d|%010d|%010d|%s' "$median" "$p90" "$avg" "$key")")
+dot_kdig() {
+  local key="$1" ip="$2" host="$3" round="$4" tls out i=0 d line
+  shift 4
+  tls=+tls
+  [ -n "$CA_FILE" ] && tls="+tls-ca=$CA_FILE"
+  # kdig сам меряет время каждого запроса; +keepopen держит одно TLS-соединение.
+  out=$(kdig @"$ip" "$tls" "+tls-hostname=$host" "+tls-sni=$host" +keepopen \
+    +timeout=$((OPT_TIMEOUT + 2)) +retry=0 +noall +header +stats "$@" 2>&1 | awk '
+    /WARNING:/ { w = w " " $0 }
+    /->>HEADER<<-/ { s = $0; sub(/.*status: /, "", s); sub(/;.*/, "", s) }
+    /^;; Flags:/ { a = $0; sub(/.*ANSWER: /, "", a); sub(/;.*/, "", a) }
+    / in [0-9.]+ ms$/ { print "ok", (s == "" ? "NONE" : s), (a == "" ? 0 : a), $(NF - 1); s = ""; a = ""; w = "" }
+    /ERROR:/ {
+      r = "neterr"
+      if (w ~ /certificate/) r = "cert"; else if (w ~ /timeout/) r = "timeout"
+      else if (w ~ /handshake|TLS/) r = "tls"
+      print "err", r; w = ""
+    }')
+  for d in "$@"; do
+    i=$((i + 1))
+    phase_of $i
+    line=$(printf '%s\n' "$out" | sed -n "${i}p")
+    case $line in
+      ok\ *)
+        # shellcheck disable=SC2086
+        set -- $line
+        status_from_rcode "$2" "$3"
+        ms_to_us "$4"
+        emit "$key" "$round" "$d" "$PHASE" "$R_STATUS" "$US" ;;
+      err\ *) emit "$key" "$round" "$d" "$PHASE" "${line#err }" 0 ;;
+      *) emit "$key" "$round" "$d" "$PHASE" timeout 0 ;;
+    esac
   done
-
-  printf '\n'
-  section_heading "$(mode_label "$mode") Top ${TOP_N}"
-
-  if [ "${#records[@]}" -eq 0 ]; then
-    printf '  %s\n' "$(txt no_stable_candidates)"
-    return 0
-  fi
-
-  while IFS='|' read -r median p90 avg key; do
-    [ -n "$key" ] || continue
-    rank=$((rank + 1))
-    if [ "$rank" -gt "$TOP_N" ]; then
-      break
-    fi
-
-    stats=$(compute_stats "$key")
-    IFS='|' read -r median avg p90 success total success_rate_x10 <<<"$stats"
-    line=$(render_recommendation_reason "$mode" "$rank" "$median" "$p90" "$success_rate_x10")
-    setup=$(render_target_setup "$key")
-
-    printf '  %s %s\n' \
-      "$(rank_badge "$rank")" \
-      "$(emphasis_text "${TARGET_NAME[$key]}")"
-
-    printf '     %s %sms   %s %sms   %s %sms   %s %s\n' \
-      "$(metric_label "median")" \
-      "$median" \
-      "$(metric_label "p90")" \
-      "$p90" \
-      "$(metric_label "avg")" \
-      "$avg" \
-      "$(metric_label "success")" \
-      "$(format_percent_x10 "$success_rate_x10")"
-
-    if [ "${TARGET_MODE[$key]}" = "doh" ] || [ "${TARGET_MODE[$key]}" = "dot" ]; then
-      printf '     %s %s   %s %s\n' \
-        "$(metric_label "family")" \
-        "${TARGET_FAMILY[$key]}" \
-        "$(metric_label "reason")" \
-        "$line"
-    else
-      printf '     %s %s\n' \
-        "$(metric_label "reason")" \
-        "$line"
-    fi
-
-    printf '     %s %s\n' "$(metric_label "setup")" "$(emphasis_text "$setup")"
-  done < <(printf '%s\n' "${records[@]}" | sort)
 }
 
-render_system_reference() {
-  local printed=0
-  local key
-  local stats
-  local median
-  local avg
-  local p90
-  local success
-  local total
-  local success_rate_x10
+dot_openssl() {
+  local key="$1" ip="$2" host="$3" round="$4" j="$TMPD/tls.$JOB" n st
+  shift 4
+  rm -f "$j.n" "$j.st"
+  # Подоболочка: свои дескрипторы 3/4 и игнор SIGPIPE на случай, если openssl уже вышел.
+  (
+    trap '' PIPE
+    rm -f "$j.in" "$j.out"
+    mkfifo "$j.in" "$j.out" || { echo neterr >"$j.st"; exit 0; }
+    ca=
+    [ -n "$CA_FILE" ] && ca="-CAfile $CA_FILE"
+    target="$ip:853"
+    case $ip in *:*) target="[$ip]:853" ;; esac
+    now_us; ts=$NOW
+    # shellcheck disable=SC2086
+    openssl s_client -connect "$target" -servername "$host" -verify_return_error \
+      -verify_hostname "$host" $ca -quiet <"$j.in" >"$j.out" 2>"$j.err" &
+    spid=$!
+    watchdog "$spid" $(( (OPT_TIMEOUT + 2) * ($# + 1) ))
+    swd=$WD
+    exec 3>"$j.in" 4<"$j.out"
+    i=0
+    for d in "$@"; do
+      i=$((i + 1))
+      phase_of $i
+      rand16
+      build_query "$d" "$R16"
+      # Читатель запускается до отправки запроса, его старт не попадает в замер.
+      dd bs=1 count=4 <&4 >"$j.h" 2>/dev/null &
+      rp=$!
+      wait_exec "$rp" dd
+      now_us; t0=$NOW
+      [ $i -eq 1 ] && t0=$ts
+      printf "$P$Q" >&3 2>/dev/null
+      watchdog "$rp" $((OPT_TIMEOUT + 2))
+      wait "$rp"
+      now_us
+      cancel_watchdog
+      h=$(hex_file "$j.h")
+      if [ ${#h} -ne 8 ]; then
+        st=timeout
+        case $(cat "$j.err" 2>/dev/null) in
+          *verify* | *certificate*) st=cert ;;
+          *refused* | *unreachable* | *errno*) st=neterr ;;
+          *ssl* | *SSL* | *alert*) st=tls ;;
+        esac
+        echo "$st" >"$j.st"
+        break
+      fi
+      len=$((0x${h%????}))
+      dd bs=1 count=$((len - 2)) <&4 >"$j.b" 2>/dev/null
+      parse_dns "${h#????}$(hex_file "$j.b")" "$(printf '%04x' "$R16")"
+      emit "$key" "$round" "$d" "$PHASE" "$R_STATUS" $((NOW - t0))
+      echo "$i" >"$j.n"
+    done
+    exec 3>&- 4<&-
+    kill "$spid" 2>/dev/null
+    WD=$swd
+    cancel_watchdog
+    wait "$spid" 2>/dev/null
+  )
+  n=$(cat "$j.n" 2>/dev/null)
+  st=$(cat "$j.st" 2>/dev/null)
+  [ "${n:-0}" -lt $# ] && emit_rest "$key" "$round" "${st:-timeout}" $(( ${n:-0} + 1 )) "$@"
+  rm -f "$j.n" "$j.st" "$j.in" "$j.out"
+}
 
-  printf '\n'
-  section_heading "$(txt system_reference)"
+url_host() { UH=${1#https://}; UH=${UH%%/*}; }
 
-  for key in "${TARGET_KEYS[@]}"; do
-    [ "${TARGET_PUBLIC[$key]}" = "no" ] || continue
-
-    printed=1
-    if [ "${RESULT_QUARANTINED[$key]:-0}" -eq 1 ]; then
-      printf '  %s %s - %s\n' "$(status_tag "QUAR")" "${TARGET_NAME[$key]}" "${RESULT_QUARANTINE_REASON[$key]}"
+doh_curl() {
+  local key="$1" ip="$2" url="$3" round="$4" i=0 d sep='?' line code ex tst tpre params
+  shift 4
+  url_host "$url"
+  case $url in *\?*) sep='&' ;; esac
+  params=$(doh_params "$@")
+  local doms="$*" f="$TMPD/doh.$JOB"
+  set --
+  for p in $params; do
+    i=$((i + 1))
+    rm -f "$f.$i"
+    set -- "$@" -o "$f.$i" "$url${sep}dns=$p"
+  done
+  # Один процесс curl на сессию: соединение переиспользуется, тайминги curl считает сам.
+  # shellcheck disable=SC2086
+  line=$(curl -s $CURL_H2 --resolve "$UH:443:$ip" --connect-timeout $((OPT_TIMEOUT + 2)) \
+    -m $((OPT_TIMEOUT * 2 + 4)) -H 'accept: application/dns-message' \
+    -w '%{http_code} %{exitcode} %{time_starttransfer} %{time_pretransfer}\n' "$@" 2>/dev/null)
+  i=0
+  for d in $doms; do
+    i=$((i + 1))
+    phase_of $i
+    # shellcheck disable=SC2046
+    set -- $(printf '%s\n' "$line" | sed -n "${i}p")
+    code=${1:-000} ex=${2:-28} tst=${3:-0} tpre=${4:-0}
+    if [ "$ex" != 0 ]; then
+      case $ex in
+        28) st=timeout ;; 35) st=tls ;; 51 | 58 | 60 | 77 | 83 | 90 | 91) st=cert ;;
+        16 | 92) st=h2 ;; *) st=neterr ;;
+      esac
+      emit "$key" "$round" "$d" "$PHASE" "$st" 0
       continue
     fi
+    if [ "$code" != 200 ]; then
+      st="http$code"
+      [ "$code" = 505 ] && st=h2
+      emit "$key" "$round" "$d" "$PHASE" "$st" 0
+      continue
+    fi
+    parse_dns "$(hex_file "$f.$i")" 0000
+    # Первый запрос: всё вместе с TCP и TLS. Остальные: от отправки до первого байта ответа.
+    sec_to_us "$tst"
+    us=$US
+    if [ $i -gt 1 ]; then sec_to_us "$tpre"; us=$((us - US)); fi
+    emit "$key" "$round" "$d" "$PHASE" "$R_STATUS" "$us"
+  done
+}
 
-    stats=$(compute_stats "$key")
-    IFS='|' read -r median avg p90 success total success_rate_x10 <<<"$stats"
-
-    if [ "$success" -gt 0 ]; then
-      printf '  %s %-26s %s %sms, %s %sms, %s %sms, %s %s\n' \
-        "$(status_tag "INFO")" \
-        "${TARGET_NAME[$key]} ($(mode_label "${TARGET_MODE[$key]}"))" \
-        "$(metric_label "median")" \
-        "$median" \
-        "$(metric_label "p90")" \
-        "$p90" \
-        "$(metric_label "avg")" \
-        "$avg" \
-        "$(metric_label "success")" \
-        "$(format_percent_x10 "$success_rate_x10")"
+# Запасной DoH через wget/uclient-fetch: без переиспользования соединения и без
+# пиннинга IP, поэтому все замеры холодные.
+doh_fetch() {
+  local key="$1" url="$3" round="$4" i=0 d p sep='?' f pid t0 params rc
+  shift 4
+  case $url in *\?*) sep='&' ;; esac
+  params=$(doh_params "$@")
+  f="$TMPD/dohf.$JOB"
+  for d in "$@"; do
+    i=$((i + 1))
+    p=$(printf '%s\n' "$params" | sed -n "${i}p")
+    rm -f "$f"
+    now_us; t0=$NOW
+    "$DOH_BACKEND" -q -T $((OPT_TIMEOUT + 2)) -O "$f" --header 'accept: application/dns-message' "$url${sep}dns=$p" >/dev/null 2>&1 &
+    pid=$!
+    watchdog "$pid" $((OPT_TIMEOUT + 3))
+    wait "$pid"
+    rc=$?
+    now_us
+    cancel_watchdog
+    if [ -s "$f" ]; then
+      parse_dns "$(hex_file "$f")" 0000
+      emit "$key" "$round" "$d" cold "$R_STATUS" $((NOW - t0))
+    elif [ "$rc" -gt 128 ]; then
+      emit "$key" "$round" "$d" cold timeout 0
     else
-      printf '  %s %-26s no successful responses\n' \
-        "$(status_tag "DOWN")" \
-        "${TARGET_NAME[$key]} ($(mode_label "${TARGET_MODE[$key]}"))"
+      emit "$key" "$round" "$d" cold neterr 0
     fi
   done
-
-  if [ "$printed" -eq 0 ]; then
-    printf '  %s\n' "$(txt no_system_reference)"
-  fi
 }
 
-render_quarantine_summary() {
-  local printed=0
-  local key
+# ---------------------------------------------------------------------------
+# Цели: key|provider|name|region|variant|mode|addr|endpoint|kind
 
-  printf '\n'
-  section_heading "$(txt quarantined_targets)"
+build_targets() {
+  catalog | awk -v prov="$OPT_PROVIDERS" -v modes=",$MODES," -v vars=",$OPT_VARIANTS," -F'|' '
+    /^@/ { id = substr($1, 2); name = $2; region = $3; variant = $4; next }
+    {
+      split($0, f, " ")
+      if (index(modes, "," f[1] ",") == 0) next
+      if (prov == "system") next
+      if (prov != "all" && prov != region) next
+      if (vars != ",," && index(vars, "," variant ",") == 0) next
+      print id "." f[1] "|" id "|" name "|" region "|" variant "|" f[1] "|" f[2] "|" f[3] "|public"
+    }' >"$TMPD/targets"
 
-  for key in "${TARGET_KEYS[@]}"; do
-    [ "${RESULT_QUARANTINED[$key]:-0}" -eq 1 ] || continue
-    printed=1
-    printf '  %s %-24s %-7s %s\n' \
-      "$(status_tag "QUAR")" \
-      "$(emphasis_text "${TARGET_NAME[$key]}")" \
-      "$(muted_text "$(mode_transport_label "$key")")" \
-      "$(muted_text "${RESULT_QUARANTINE_REASON[$key]}")"
+  case $OPT_PROVIDERS in all | system) ;; *) return 0 ;; esac
+  local ns n=0 m
+  [ -r /etc/resolv.conf ] || return 0
+  while read -r m ns _; do
+    [ "$m" = nameserver ] || continue
+    case $ns in *%*) continue ;; esac
+    n=$((n + 1))
+    case $ns in *:*) m=dns6 ;; *) m=dns4 ;; esac
+    case ",$MODES," in *",$m,"*) ;; *) continue ;; esac
+    printf 'system%s.%s|system%s|System %s|local|system|%s|%s||system\n' "$n" "$m" "$n" "$ns" "$m" "$ns" >>"$TMPD/targets"
+  done </etc/resolv.conf
+}
+
+# ---------------------------------------------------------------------------
+# Проверки сети
+
+check_hijack() { # ip → HJ=yes|no|unknown
+  udp_query "$1" ya.ru
+  case $R_STATUS in
+    ok) HJ=yes ;;
+    timeout | neterr) HJ=unknown ;;
+    *) HJ=no ;;
+  esac
+}
+
+# Проверка доступности: один запрос с повтором; пишет "key status" в файл задания.
+probe_target() {
+  local key="$1" mode="$2" addr="$3" ep="$4" d="$5" try=0
+  while [ $try -lt 2 ]; do
+    try=$((try + 1))
+    case $mode in
+      dns4 | dns6) udp_query "$addr" "$d" ;;
+      *)
+        OUT="$TMPD/probe.$JOB.rec"
+        : >"$OUT"
+        session "$key" "$mode" "$addr" "$ep" 0 "$d"
+        R_STATUS=$(cut -f5 "$OUT" | head -n 1)
+        ;;
+    esac
+    [ "$R_STATUS" = ok ] && break
   done
-
-  if [ "$printed" -eq 0 ]; then
-    printf '  %s\n' "$(txt no_quarantine)"
-  fi
+  rm -f "$TMPD/probe.$JOB.rec"
+  # Короткие строки с O_APPEND пишутся атомарно, общий файл для всех заданий безопасен.
+  echo "$key ${R_STATUS:-timeout}" >>"$TMPD/probe"
 }
 
-render_final_report() {
-  local mode
+# Доступность проверяется параллельно: мёртвые цели отсекаются за один таймаут, а не за сумму.
+probe_all() {
+  local n=0 total key mode addr ep st
+  total=$(wc -l <"$TMPD/targets")
+  : >"$TMPD/down"
+  : >"$TMPD/probe"
+  JOBS=0
+  while IFS='|' read -r key _ _ _ _ mode addr ep _; do
+    n=$((n + 1))
+    if [ "$mode" = dns6 ] && [ "$HAVE_V6" != yes ]; then
+      echo "$key noipv6" >>"$TMPD/down"
+      continue
+    fi
+    JOB=$n
+    probe_target "$key" "$mode" "$addr" "$ep" "${DOMAIN_LIST%% *}" </dev/null &
+    JOBS=$((JOBS + 1))
+    if [ $JOBS -ge $PAR ]; then wait; JOBS=0; fi
+    progress "$M_PROBE" "$n" "$total" ""
+  done <"$TMPD/targets"
+  wait
+  JOB=0
+  while read -r key st; do
+    [ "$st" = ok ] || echo "$key $st"
+  done <"$TMPD/probe" >>"$TMPD/down"
+}
 
-  printf '\n'
-  printf '%s\n' "================================================================"
-  printf '%s\n' "$(style_text "$BOLD" "$(txt final_report)")"
-  printf '%s\n' "================================================================"
-  printf '%s\n' "$(txt final_hint)"
+progress() {
+  [ "$PROGRESS" = 1 ] || return 0
+  printf '\r\033[K%s %s/%s %s' "$1" "$2" "$3" "$4" >&2
+}
+progress_done() { [ "$PROGRESS" = 1 ] && printf '\r\033[K' >&2; }
 
-  for mode in "${SELECTED_MODES[@]}"; do
-    render_mode_top "$mode"
+run_rounds() {
+  local r=1 n=0 total alive key name mode addr ep doms d k
+  awk -F'|' 'FILENAME == ARGV[1] { split($0, f, " "); down[f[1]] = 1; next } !($1 in down)' \
+    "$TMPD/down" "$TMPD/targets" >"$TMPD/alive"
+  alive=$(wc -l <"$TMPD/alive")
+  total=$((alive * ROUNDS))
+  OUT=$TMPD/results
+  : >"$OUT"
+  while [ $r -le "$ROUNDS" ]; do
+    # Каждый раунд: другой порядок целей и сдвиг списка доменов, чтобы холодный
+    # первый запрос и кеш резолверов распределялись равномерно.
+    doms=$DOMAIN_LIST
+    k=1
+    while [ "$DOMAIN_COUNT" -gt 1 ] && [ $k -lt $(( (r - 1) % DOMAIN_COUNT + 1 )) ]; do
+      doms="${doms#* } ${doms%% *}"
+      k=$((k + 1))
+    done
+    awk -v seed="$r$$" 'BEGIN { srand(seed) } { print rand() "\t" $0 }' "$TMPD/alive" | sort -n | cut -f2- >"$TMPD/order"
+    while IFS='|' read -r key _ name _ _ mode addr ep _; do
+      n=$((n + 1))
+      progress "$M_ROUND $r/$ROUNDS" "$n" "$total" "$name"
+      case $mode in
+        dns4 | dns6)
+          for d in $doms; do
+            udp_query "$addr" "$d"
+            emit "$key" "$r" "$d" single "$R_STATUS" "$R_US"
+          done
+          ;;
+        *)
+          # shellcheck disable=SC2086
+          session "$key" "$mode" "$addr" "$ep" "$r" $doms
+          ;;
+      esac
+    done <"$TMPD/order"
+    r=$((r + 1))
   done
-
-  render_system_reference
-  render_quarantine_summary
-  printf '\n'
+  progress_done
 }
+
+# ---------------------------------------------------------------------------
+# Отчёт: статистика и таблицы считаются в awk за один проход.
+
+report() {
+  local width
+  width=${COLS:-80}
+  # BusyBox sort на роутерах бывает без -k/-t: сортируем целые строки, время — с нулями слева.
+  awk -F'\t' '{ printf "%s\t%s\t%s\t%012d\n", $1, $4, $5, $6 }' "$TMPD/results" | sort >"$TMPD/results.sorted"
+  awk -F'\t' \
+    -v modes="$MODES" -v top="$OPT_TOP" -v width="$width" -v csv="$OPT_CSV" -v lossmax="$LOSS_MAX" \
+    -v hj4="$HIJACK4" -v hj6="$HIJACK6" -v lang="$L" \
+    -v bl_dns4="$BL_dns4" -v bl_dns6="$BL_dns6" -v bl_dot="$BL_dot" -v bl_doh="$BL_doh" \
+    -v cold_only="$([ "$DOH_BACKEND" = curl ] || echo doh)" \
+    -v c_rst="$C_RST" -v c_b="$C_B" -v c_dim="$C_DIM" -v c_red="$C_RED" -v c_grn="$C_GRN" -v c_yel="$C_YEL" -v c_cyn="$C_CYN" \
+    -v h_num="$M_C_NUM" -v h_name="$M_C_NAME" -v h_var="$M_C_VAR" -v h_addr="$M_C_ADDR" \
+    -v h_med="$M_C_MED" -v h_p90="$M_C_P90" -v h_cold="$M_C_COLD" -v h_loss="$M_C_LOSS" -v u_ms="$M_MS" \
+    -v n_udp="$M_N_UDP" -v n_tls="$M_N_TLS" -v n_cold="$M_N_COLD" -v n_sys="$M_N_SYS" -v n_hj="$M_HIJACK_NOTE" \
+    -v t_dns4="DNS v4 (UDP/53)" -v t_dns6="DNS v6 (UDP/53)" -v t_dot="DoT (TLS/853)" -v t_doh="DoH (HTTPS)" \
+    -v m_rec="$M_REC" -v m_norec="$M_NOREC" \
+    -v s_timeout="$S_timeout" -v s_refused="$S_refused" -v s_servfail="$S_servfail" -v s_nxdomain="$S_nxdomain" \
+    -v s_empty="$S_empty" -v s_tls="$S_tls" -v s_cert="$S_cert" -v s_neterr="$S_neterr" -v s_badresp="$S_badresp" \
+    -v s_h2="$S_h2" -v s_http="$S_http" -v s_fail="$S_fail" -v s_noipv6="IPv6: $M_NO" '
+  function vlen(s,  t) { t = s; return length(s) - gsub(/[\200-\277]/, "", t) }
+  function pad(s, w) { while (vlen(s) < w) s = s " "; return s }
+  function lpad(s, w) { while (vlen(s) < w) s = " " s; return s }
+  function cut(s, w) { return length(s) > w ? substr(s, 1, w - 2) ".." : s }
+  function ms(us) { return sprintf("%.1f", us / 1000) }
+  function reason(st) {
+    if (st ~ /^http/) return s_http " " substr(st, 5)
+    if (st == "timeout") return s_timeout; if (st == "refused") return s_refused
+    if (st == "servfail") return s_servfail; if (st == "nxdomain") return s_nxdomain
+    if (st == "empty") return s_empty; if (st == "tls") return s_tls; if (st == "cert") return s_cert
+    if (st == "neterr") return s_neterr; if (st == "h2") return s_h2; if (st == "noipv6") return s_noipv6
+    if (st == "fail") return s_fail
+    return s_badresp
+  }
+  FILENAME == ARGV[1] {
+    split($0, f, "|")
+    k = f[1]; T[k] = 1; NAME[k] = f[3]; VAR[k] = f[5]; MODE[k] = f[6]; ADDR[k] = f[7]; EP[k] = f[8]; KIND[k] = f[9]
+    ORDER[++nt] = k
+    next
+  }
+  FILENAME == ARGV[2] { split($0, f, " "); DOWN[f[1]] = f[2]; next }
+  {
+    k = $1; ph = $2; st = $3
+    TOT[k]++
+    if (st != "ok") { ERR[k, st]++; if (ERR[k, st] > ERRMAX[k]) { ERRMAX[k] = ERR[k, st]; ERRTOP[k] = st }; next }
+    OK[k]++
+    n = ++CNT[k, ph]; S[k, ph, n] = $4 + 0; SUM[k, ph] += $4
+  }
+  function q(k, ph, p,  n, i) { n = CNT[k, ph]; if (!n) return -1; i = int(n * p + 0.9999); if (i < 1) i = 1; return S[k, ph, i] }
+  function med(k, ph,  n) {
+    n = CNT[k, ph]; if (!n) return -1
+    return n % 2 ? S[k, ph, (n + 1) / 2] : (S[k, ph, n / 2] + S[k, ph, n / 2 + 1]) / 2
+  }
+  END {
+    nm = split(modes, M, ",")
+    wide = width >= 100
+    for (mi = 1; mi <= nm; mi++) {
+      m = M[mi]; tls = (m == "dot" || m == "doh")
+      hj = (m == "dns4" && hj4 == "yes") || (m == "dns6" && hj6 == "yes")
+      rows = 0
+      for (i = 1; i <= nt; i++) {
+        k = ORDER[i]; if (MODE[k] != m) continue
+        ph = tls ? (CNT[k, "warm"] ? "warm" : "cold") : "single"
+        R[++rows] = k; PH[k] = ph
+        MED[k] = med(k, ph); P90[k] = q(k, ph, 0.9)
+        COLD[k] = tls ? med(k, "cold") : -1
+        LOSS[k] = TOT[k] ? (TOT[k] - OK[k]) * 100 / TOT[k] : 100
+        # Ключ сортировки: живые без потерь, живые с потерями, системные, недоступные.
+        cls = (k in DOWN || !OK[k]) ? 3 : (LOSS[k] > lossmax ? 1 : 0)
+        if (KIND[k] == "system" && cls < 3) cls = 2
+        KEY[k] = sprintf("%d %012d %012d", cls, MED[k] < 0 ? 0 : MED[k], P90[k] < 0 ? 0 : P90[k])
+        CLS[k] = cls
+      }
+      if (!rows) continue
+      for (i = 2; i <= rows; i++) { x = R[i]; for (j = i - 1; j >= 1 && KEY[R[j]] > KEY[x]; j--) R[j + 1] = R[j]; R[j + 1] = x }
+
+      title = m == "dns4" ? t_dns4 : m == "dns6" ? t_dns6 : m == "dot" ? t_dot : t_doh
+      bl = m == "dns4" ? bl_dns4 : m == "dns6" ? bl_dns6 : m == "dot" ? bl_dot : bl_doh
+      printf "\n%s%s%s  %s%s%s\n", c_b, title, c_rst, c_dim, bl, c_rst
+      if (hj) printf "%s! %s%s\n", c_red, n_hj, c_rst
+      wn = wide ? 24 : 20; wa = wide ? 34 : 0
+      line = lpad(h_num, 3) "  " pad(h_name, wn) pad(h_var, 9)
+      if (wide) line = line pad(h_addr, wa)
+      line = line lpad(h_med, 8) lpad(h_p90, 8)
+      if (tls) line = line lpad(h_cold, 10)
+      line = line lpad(h_loss, 8)
+      printf "%s%s%s\n", c_dim, line, c_rst
+
+      shown = 0; rank = 0; nrec = 0
+      for (i = 1; i <= rows; i++) {
+        k = R[i]
+        addr = m == "doh" ? EP[k] : m == "dot" ? EP[k] : ADDR[k]
+        if (CLS[k] == 3) {
+          st = (k in DOWN) ? DOWN[k] : ERRTOP[k]
+          if (top > 0 && shown >= top) continue
+          line = "  -  " pad(cut(NAME[k], wn - 1), wn) pad(VAR[k], 9)
+          if (wide) line = line pad(cut(addr, wa - 1), wa)
+          printf "%s%s%s%s\n", c_dim, line, c_red reason(st), c_rst
+          shown++
+          if (csv != "") printf "%s,%s,%s,%s,%s,,,,,100,0,%s\n", m, NAME[k], VAR[k], ADDR[k], EP[k], st >> csv
+          continue
+        }
+        if (CLS[k] < 2) rank++
+        if (top > 0 && shown >= top) continue
+        num = CLS[k] < 2 ? rank : "*"
+        cn = (CLS[k] == 0 && rank <= 3 && !hj) ? c_grn : ""
+        line = lpad(num, 3) "  " pad(cut(NAME[k], wn - 1), wn) pad(VAR[k], 9)
+        if (wide) line = line pad(cut(addr, wa - 1), wa)
+        cell = lpad(ms(MED[k]), 8) lpad(ms(P90[k]), 8)
+        if (tls) cell = cell lpad(COLD[k] < 0 ? "-" : ms(COLD[k]), 10)
+        ls = sprintf("%.0f%%", LOSS[k])
+        lc = LOSS[k] > 0 ? c_yel : ""
+        note = CLS[k] == 2 ? "  " c_dim n_sys c_rst : (LOSS[k] > 0 && ERRTOP[k] != "" ? "  " c_dim reason(ERRTOP[k]) c_rst : "")
+        printf "%s%s%s%s%s%s%s\n", cn, line, c_rst, cell, lc lpad(ls, 8), c_rst, note
+        shown++
+        if (csv != "") printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%.1f,%d,ok\n", m, NAME[k], VAR[k], ADDR[k], EP[k], ms(MED[k]), ms(P90[k]), CNT[k, PH[k]] ? ms(SUM[k, PH[k]] / CNT[k, PH[k]]) : "", COLD[k] < 0 ? "" : ms(COLD[k]), LOSS[k], TOT[k] >> csv
+        if (CLS[k] == 0 && KIND[k] == "public" && nrec < 3 && !hj) { nrec++; REC[m, nrec] = k }
+      }
+      if (rows > shown) printf "%s  ... +%d%s\n", c_dim, rows - shown, c_rst
+      printf "%s%s%s\n", c_dim, tls ? (m == cold_only ? n_cold : n_tls) : n_udp, c_rst
+      NREC[m] = nrec
+    }
+
+    printf "\n%s%s%s\n", c_b, m_rec, c_rst
+    for (mi = 1; mi <= nm; mi++) {
+      m = M[mi]
+      title = m == "dns4" ? "DNS v4" : m == "dns6" ? "DNS v6" : m == "dot" ? "DoT" : "DoH"
+      if (!NREC[m]) {
+        hj = (m == "dns4" && hj4 == "yes") || (m == "dns6" && hj6 == "yes")
+        printf "  %-7s %s%s%s\n", title, c_dim, hj ? n_hj : m_norec, c_rst
+        continue
+      }
+      for (r = 1; r <= NREC[m]; r++) {
+        k = REC[m, r]
+        setup = m == "doh" ? EP[k] : m == "dot" ? EP[k] " (" ADDR[k] ")" : ADDR[k]
+        printf "  %-7s %s%d. %s%s  %s%s%s  %s %s\n", r == 1 ? title : "", c_grn, r, NAME[k], c_rst, c_cyn, setup, c_rst, ms(MED[k]), u_ms
+      }
+    }
+  }' "$TMPD/targets" "$TMPD/down" "$TMPD/results.sorted"
+}
+
+# ---------------------------------------------------------------------------
+# Самопроверка: эталоны из RFC 8484 и вручную собранные ответы.
+
+self_test() {
+  local fail=0 got
+  TMPD=${TMPDIR:-/tmp}/dnstest.self.$$
+  mkdir -p "$TMPD" || die "tmp"
+  hex_init
+  check() { if [ "$2" = "$3" ]; then printf 'ok    %s\n' "$1"; else printf 'FAIL  %s: %s != %s\n' "$1" "$2" "$3"; fail=1; fi; }
+  build_query www.example.com 0
+  printf "$Q" >"$TMPD/q"
+  check "build_query" "$(hex_file "$TMPD/q")" "00000100000100000000000003777777076578616d706c6503636f6d0000010001"
+  check "query length" "$QLEN" 33
+  printf "$P" >"$TMPD/p"
+  check "tcp prefix" "$(hex_file "$TMPD/p")" "0021"
+  check "base64url (RFC 8484)" "$(doh_params www.example.com)" "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
+  check "base64url digits" "$(doh_params a-1.b2)" "AAABAAABAAAAAAAAA2EtMQJiMgAAAQAB"
+  parse_dns "abcd81800001000300000000" abcd; check "parse ok" "$R_STATUS" ok
+  parse_dns "abcd81830001000000000000" abcd; check "parse nxdomain" "$R_STATUS" nxdomain
+  parse_dns "abcd81850001000000000000" abcd; check "parse refused" "$R_STATUS" refused
+  parse_dns "abcd81820001000000000000" abcd; check "parse servfail" "$R_STATUS" servfail
+  parse_dns "abcd81800001000000000000" abcd; check "parse empty" "$R_STATUS" empty
+  parse_dns "abce81800001000300000000" abcd; check "parse wrong id" "$R_STATUS" badresp
+  parse_dns "abcd01000001000300000000" abcd; check "parse query, not answer" "$R_STATUS" badresp
+  ms_to_us 73.6; check "ms_to_us" "$US" 73600
+  ms_to_us 4; check "ms_to_us int" "$US" 4000
+  sec_to_us 0.073456; check "sec_to_us" "$US" 73456
+  sec_to_us 1.000009; check "sec_to_us leading zeros" "$US" 1000009
+  valid_domain ya.ru && got=yes || got=no; check "valid ya.ru" "$got" yes
+  valid_domain "xn--80ak6aa92e.com" && got=yes || got=no; check "valid punycode" "$got" yes
+  valid_domain "пример.рф" && got=yes || got=no; check "reject IDN" "$got" no
+  valid_domain "a..b" && got=yes || got=no; check "reject empty label" "$got" no
+  rm -rf "$TMPD"
+  return $fail
+}
+
+# ---------------------------------------------------------------------------
+# Аргументы и вопросы
+
+parse_args() {
+  local opt val
+  while [ $# -gt 0 ]; do
+    opt=$1 val=
+    case $opt in
+      --*=*) val=${opt#*=}; opt=${opt%%=*} ;;
+      --lang | --profile | --runs | --domains | --custom-domains | --providers | --modes | --variants | --top | --timeout | --csv)
+        [ $# -ge 2 ] || { USAGE_ERR="$opt"; return 0; }
+        val=$2; shift ;;
+    esac
+    case $opt in
+      --lang) OPT_LANG=$val ;;
+      --profile) OPT_PROFILE=$val ;;
+      --runs) OPT_RUNS=$val ;;
+      --domains) OPT_DOMAINS=$val ;;
+      --custom-domains) OPT_CUSTOM=$val; OPT_DOMAINS=custom ;;
+      --providers) OPT_PROVIDERS=$val ;;
+      --modes) OPT_MODES=$val ;;
+      --variants) OPT_VARIANTS=$val ;;
+      --top) OPT_TOP=$val ;;
+      --timeout) OPT_TIMEOUT=$val ;;
+      --csv) OPT_CSV=$val ;;
+      --no-color) OPT_COLOR=off ;;
+      -y | --yes) OPT_YES=1 ;;
+      --list) ACTION=list ;;
+      --self-test) ACTION=selftest ;;
+      --version) ACTION=version ;;
+      -h | --help) ACTION=help ;;
+      *) USAGE_ERR=$opt; return 0 ;;
+    esac
+    shift
+  done
+}
+
+ask() { # prompt default → A
+  printf '%s [%s %s]: ' "$1" "$Q_DEFAULT" "$2" >/dev/tty
+  A=
+  read -r A </dev/tty || A=
+  [ -n "$A" ] || A=$2
+}
+
+interactive() {
+  ask "$Q_LANG" "$([ "$L" = ru ] && echo 1 || echo 2)"
+  case $A in 2 | en) set_lang en ;; *) set_lang ru ;; esac
+  ask "$Q_PROFILE" 1
+  case $A in 2) OPT_PROFILE=stability ;; *) OPT_PROFILE=quick ;; esac
+  ask "$Q_DOMAINS" 1
+  case $A in 2) OPT_DOMAINS=global ;; 3) OPT_DOMAINS=all ;; 4) OPT_DOMAINS=custom ;; *) OPT_DOMAINS=ru ;; esac
+  if [ "$OPT_DOMAINS" = custom ]; then ask "$Q_CUSTOM" "ya.ru"; OPT_CUSTOM=$A; fi
+  ask "$Q_PROVIDERS" 1
+  case $A in 2) OPT_PROVIDERS=ru ;; 3) OPT_PROVIDERS=global ;; 4) OPT_PROVIDERS=system ;; *) OPT_PROVIDERS=all ;; esac
+  local def='' m
+  for m in 1:dns4 2:dns6 3:dot 4:doh; do mode_available "${m#*:}" && def="$def,${m%%:*}"; done
+  ask "$Q_MODES" "${def#,}"
+  OPT_MODES=
+  for m in $(echo "$A" | tr ',' ' '); do
+    case $m in 1 | dns4) m='dns4' ;; 2 | dns6) m='dns6' ;; 3 | dot) m='dot' ;; 4 | doh) m='doh' ;; esac
+    OPT_MODES="$OPT_MODES,$m"
+  done
+  OPT_MODES=${OPT_MODES#,}
+  printf '\n' >/dev/tty
+}
+
+resolve_settings() {
+  case ${OPT_PROFILE:-quick} in
+    quick) ROUNDS=3 LOSS_MAX=0 ;;
+    stability) ROUNDS=10 LOSS_MAX=5 ;;
+    *) die "--profile quick|stability" ;;
+  esac
+  if [ -n "$OPT_RUNS" ]; then
+    case $OPT_RUNS in '' | *[!0-9]* | 0) die "--runs N" ;; esac
+    ROUNDS=$OPT_RUNS
+    [ "$ROUNDS" -ge 5 ] && LOSS_MAX=5
+  fi
+  case $OPT_TOP in *[!0-9]* | '') die "--top N" ;; esac
+  case $OPT_TIMEOUT in *[!0-9]* | '' | 0) die "--timeout SEC" ;; esac
+
+  case ${OPT_DOMAINS:-ru} in
+    ru) DOMAIN_LIST=$DOMAINS_RU ;;
+    global) DOMAIN_LIST=$DOMAINS_GLOBAL ;;
+    all) DOMAIN_LIST="$DOMAINS_RU $DOMAINS_GLOBAL" ;;
+    custom) DOMAIN_LIST=$(echo "$OPT_CUSTOM" | tr ',' ' ') ;;
+    *) die "--domains ru|global|all|custom" ;;
+  esac
+  local d list='' m
+  for d in $DOMAIN_LIST; do
+    valid_domain "$d" || die "domain: $d"
+    list="$list $d"
+  done
+  DOMAIN_LIST=${list# }
+  [ -n "$DOMAIN_LIST" ] || die "--custom-domains"
+  DOMAIN_COUNT=0
+  for d in $DOMAIN_LIST; do DOMAIN_COUNT=$((DOMAIN_COUNT + 1)); done
+
+  case ${OPT_PROVIDERS:=all} in all | ru | global | system) ;; *) die "--providers all|ru|global|system" ;; esac
+
+  MODES=
+  if [ -z "$OPT_MODES" ]; then
+    for m in dns4 dns6 dot doh; do mode_available "$m" && MODES="$MODES,$m"; done
+  else
+    for m in $(echo "$OPT_MODES" | tr ',' ' '); do
+      case $m in dns4 | dns6 | dot | doh) ;; *) die "--modes dns4,dns6,dot,doh: $m" ;; esac
+      if mode_available "$m"; then MODES="$MODES,$m"; else warn "$m: $M_NONE"; fi
+    done
+  fi
+  MODES=${MODES#,}
+  [ -n "$MODES" ] || die "--modes: $M_NONE"
+}
+
+print_catalog() {
+  catalog | awk -F'|' '/^@/ { printf "\n%s  [%s, %s]\n", $2, $3, $4; next } { printf "  %s\n", $0 }'
+}
+
+# ---------------------------------------------------------------------------
 
 main() {
-  local run
-
   parse_args "$@"
-  detect_terminal
+  case ${OPT_LANG:-${LC_MESSAGES:-${LANG:-}}} in ru*) set_lang ru ;; *) set_lang en ;; esac
+  [ -z "${USAGE_ERR:-}" ] || { usage >&2; die "$USAGE_ERR"; }
+  case $ACTION in
+    help) usage; exit 0 ;;
+    version) echo "dns-speedtest $VERSION"; exit 0 ;;
+    list) print_catalog; exit 0 ;;
+    selftest) self_test; exit $? ;;
+  esac
 
-  if probe_ipv6_stack; then
-    IPV6_STACK_AVAILABLE=true
+  TMPD=$(mktemp -d "${TMPDIR:-/tmp}/dnstest.XXXXXX" 2>/dev/null) || {
+    TMPD=${TMPDIR:-/tmp}/dnstest.$$
+    mkdir "$TMPD" || die "tmp"
+  }
+  trap 'rm -rf "$TMPD"' EXIT
+  trap 'progress_done; exit 130' INT TERM
+  JOB=0
+
+  timer_init
+  now_us
+  RNG=$(( ($$ * 7919 + NOW) % 2147483647 ))
+  hex_init
+  have awk || die "awk"
+  have sort || die "sort"
+  detect_env
+
+  if [ $# -eq 0 ] && [ "$OPT_YES" = 0 ] && (: </dev/tty) 2>/dev/null; then
+    interactive
   fi
-  now_ms >/dev/null
+  color_init
+  resolve_settings
+  calibrate_nslookup
 
-  if [ -z "$PROFILE" ] && [ -z "$DOMAINS_CHOICE" ] && [ -z "$PROVIDERS_CHOICE" ] && [ "${#SELECTED_MODES[@]}" -eq 0 ] && [ -z "$RUNS" ]; then
-    run_interactive_setup
-  else
-    [ -n "$PROFILE" ] || PROFILE="quick"
-    [ -n "$DOMAINS_CHOICE" ] || DOMAINS_CHOICE="ru"
-    [ -n "$PROVIDERS_CHOICE" ] || PROVIDERS_CHOICE="all"
-    [ "${#SELECTED_MODES[@]}" -gt 0 ] || parse_modes "dns4,doh,dot"
-  fi
+  COLS=${COLUMNS:-}
+  [ -z "$COLS" ] && COLS=$({ stty size </dev/tty; } 2>/dev/null | cut -d' ' -f2)
+  case $COLS in '' | *[!0-9]*) COLS=80 ;; esac
+  PROGRESS=0
+  [ -t 2 ] && PROGRESS=1
 
-  finalize_profile_and_runs
-  [ -n "$LANG_CHOICE" ] || LANG_CHOICE="en"
-  validate_choice "$LANG_CHOICE" ru en || die "$(txt lang_error)"
-  validate_choice "$PROVIDERS_CHOICE" system ru global all || die "$(txt providers_error)"
-  validate_choice "$DOMAINS_CHOICE" ru global all custom || die "$(txt domains_error)"
-  select_domains
   build_targets
+  [ -s "$TMPD/targets" ] || die "$M_TARGETS: 0"
 
-  print_banner
-  print_selection_summary
-  run_preflight
-
-  printf '\n'
-  printf '%s\n' "$(style_text "$BOLD" "$(txt execution)")"
-  for ((run = 1; run <= RUNS; run++)); do
-    if [ "$RUNS" -gt 1 ]; then
-      printf '\n'
-      printf -v run_label "$(txt run_fmt)" "$run" "$RUNS"
-      printf '%s\n' "$(style_text "$BLUE" "$run_label")"
-    fi
-
-    local key
-    for key in "${TARGET_KEYS[@]}"; do
-      test_target "$key"
-    done
+  local m v line=''
+  for m in dns4 dns6 dot doh; do
+    backend_label "$m"
+    line="$line · $m ${BL:-$M_NONE}"
   done
+  backend_label dns4; BL_dns4=$BL
+  backend_label dns6; BL_dns6=$BL
+  backend_label dot; BL_dot=$BL
+  backend_label doh; BL_doh=$BL
 
-  render_final_report
+  printf '%sdns-speedtest %s%s  %s%s%s\n' "$C_B" "$VERSION" "$C_RST" "$C_DIM" "$PROJECT_URL" "$C_RST"
+  printf '  %s: %s · %s: %s\n' "$M_SHELL" "$SHELL_NAME" "$M_TIMER" "$TIMER"
+  printf '  %s: %s\n' "$M_TRANSPORT" "${line# · }"
+  printf '  %s: %s\n' "$M_DOMAINS" "$DOMAIN_LIST"
+
+  HIJACK4=no HIJACK6=no HAVE_V6=no
+  case ",$MODES," in *,dns4,*)
+    check_hijack "$ROOT4"; HIJACK4=$HJ
+    case $HJ in yes) v=$C_RED$M_YES$C_RST ;; no) v=$M_NO ;; *) v=$M_UNKNOWN ;; esac
+    printf '  DNS v4: %s — %s\n' "$M_HIJACK" "$v" ;;
+  esac
+  case ",$MODES," in *,dns6,*)
+    udp_query "$V6_PROBE" ya.ru
+    # IPv6 есть, только если пришёл настоящий DNS-ответ.
+    case $R_STATUS in ok | empty | nxdomain | servfail | refused) HAVE_V6=yes ;; *) HAVE_V6=no ;; esac
+    if [ "$HAVE_V6" = yes ]; then
+      check_hijack "$ROOT6"; HIJACK6=$HJ
+      case $HJ in yes) v=$C_RED$M_YES$C_RST ;; no) v=$M_NO ;; *) v=$M_UNKNOWN ;; esac
+      printf '  DNS v6: %s — %s\n' "$M_HIJACK" "$v"
+    else
+      # Без IPv6 режим dns6 убираем целиком, чтобы не печатать таблицу из одних ошибок.
+      printf '  DNS v6: %s — %s\n' "$M_IPV6" "$M_NO"
+      MODES=$(echo ",$MODES," | sed 's/,dns6,/,/; s/^,//; s/,$//')
+      awk -F'|' '$6 != "dns6"' "$TMPD/targets" >"$TMPD/targets.v4" && mv "$TMPD/targets.v4" "$TMPD/targets"
+    fi ;;
+  esac
+  [ -n "$MODES" ] || die "--modes: $M_NONE"
+  printf '  %s: %s · %s: %s\n' "$M_ROUNDS" "$ROUNDS" "$M_TARGETS" "$(wc -l <"$TMPD/targets" | tr -d ' ')"
+  [ "$HIJACK4" = yes ] || [ "$HIJACK6" = yes ] && printf '\n%s%s%s\n' "$C_RED" "$M_HIJACK_WARN" "$C_RST"
+
+  now_us
+  START=$NOW
+  probe_all
+  run_rounds
+  [ -n "$OPT_CSV" ] && echo "mode,provider,variant,address,endpoint,median_ms,p90_ms,avg_ms,cold_ms,loss_pct,samples,status" >"$OPT_CSV"
+  report
+  now_us
+  printf '\n%s%s %s %s%s\n' "$C_DIM" "$M_DONE" "$(( (NOW - START) / 1000000 ))" "$M_SEC" "$C_RST"
+  [ -n "$OPT_CSV" ] && printf '%s: %s\n' "$M_CSV_SAVED" "$OPT_CSV"
+  return 0
 }
 
 main "$@"
